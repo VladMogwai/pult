@@ -14,6 +14,13 @@ final class HTTPServer: ObservableObject {
     nonisolated(unsafe) private var servedFiles: [String: URL] = [:]
     nonisolated(unsafe) private let fileLock = NSLock()
 
+    struct ProxyItem {
+        let targetURL: URL
+        let headers: [String: String]
+    }
+    nonisolated(unsafe) private var proxyItems: [String: ProxyItem] = [:]
+    nonisolated(unsafe) private let proxyLock = NSLock()
+
     init() {
         setupRoutes()
     }
@@ -50,6 +57,18 @@ final class HTTPServer: ObservableObject {
         return URL(string: "http://\(localIP):\(port)")
     }
 
+    // MARK: - Proxy Registration
+
+    /// Registers a CDN URL + required headers and returns a local proxy URL.
+    /// TV requests the local URL → phone fetches from CDN with stored headers → streams back.
+    func addProxy(targetURL: URL, headers: [String: String]) -> URL? {
+        guard let localIP = NetworkHelper.getLocalIPAddress() else { return nil }
+        let proxyId = UUID().uuidString
+        let item = ProxyItem(targetURL: targetURL, headers: headers)
+        proxyLock.withLock { proxyItems[proxyId] = item }
+        return URL(string: "http://\(localIP):\(port)/proxy/\(proxyId)")
+    }
+
     // MARK: - Routes
 
     private func setupRoutes() {
@@ -72,6 +91,16 @@ final class HTTPServer: ObservableObject {
 
             let mime = Self.mimeType(for: path)
 
+            // Time-based seek: ?t=<seconds> — build a self-contained MP4 from the
+            // keyframe byte offset so the TV receives a valid stream with moov header.
+            if let tParam = request.queryParams.first(where: { $0.0 == "t" })?.1,
+               let seconds = Double(tParam), seconds > 0 {
+                if let prelude = MP4SeekParser.buildSeekPrelude(for: seconds, in: fileURL) {
+                    return Self.seekResponse(path: path, mime: mime, prelude: prelude,
+                                             rangeHeader: request.headers["range"])
+                }
+            }
+
             // Range header always takes priority — Samsung uses it for buffering.
             if let rangeHeader = request.headers["range"] {
                 return Self.rangeResponse(path: path, fileSize: fileSize,
@@ -81,6 +110,53 @@ final class HTTPServer: ObservableObject {
             }
         }
 
+        // CDN proxy: TV requests /proxy/<id> → phone fetches from CDN with stored headers.
+        // Samsung sends Range requests (small chunks), so buffering per request is fine.
+        server["/proxy/:proxyId"] = { [proxyLock, weak self] request in
+            guard let self else { return .notFound }
+            let proxyId = request.params[":proxyId"] ?? ""
+            guard let item = proxyLock.withLock({ self.proxyItems[proxyId] }) else {
+                return .notFound
+            }
+
+            var cdnReq = URLRequest(url: item.targetURL, timeoutInterval: 30)
+            for (k, v) in item.headers { cdnReq.setValue(v, forHTTPHeaderField: k) }
+            if let range = request.headers["range"] {
+                cdnReq.setValue(range, forHTTPHeaderField: "Range")
+            }
+
+            let sem = DispatchSemaphore(value: 0)
+            var cdnStatus = 200
+            var cdnHeaders: [String: String] = [:]
+            var cdnData = Data()
+
+            URLSession.shared.dataTask(with: cdnReq) { data, response, _ in
+                if let http = response as? HTTPURLResponse {
+                    cdnStatus = http.statusCode
+                    for (k, v) in http.allHeaderFields {
+                        if let key = k as? String, let val = v as? String {
+                            cdnHeaders[key] = val
+                        }
+                    }
+                }
+                cdnData = data ?? Data()
+                sem.signal()
+            }.resume()
+            sem.wait()
+
+            // Pass through only safe headers; always add DLNA streaming hints.
+            var outHeaders = Self.dlnaHeaders
+            outHeaders["Content-Type"]   = cdnHeaders["Content-Type"]  ?? "video/mp4"
+            outHeaders["Content-Length"] = cdnHeaders["Content-Length"] ?? "\(cdnData.count)"
+            outHeaders["Accept-Ranges"]  = "bytes"
+            if let cr = cdnHeaders["Content-Range"] { outHeaders["Content-Range"] = cr }
+
+            let statusMsg = cdnStatus == 206 ? "Partial Content" : "OK"
+            let captured = cdnData
+            return .raw(cdnStatus, statusMsg, outHeaders) { writer in
+                try? writer.write(captured)
+            }
+        }
     }
 
     // MARK: - Response helpers
@@ -92,6 +168,79 @@ final class HTTPServer: ObservableObject {
         "contentFeatures.dlna.org": "DLNA.ORG_PN=AVC_MP4_HP_HD_AAC;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000",
         "Cache-Control":            "no-cache"
     ]
+
+    /// Serves a synthesised, seek-adjusted MP4 stream:
+    ///   [ftyp (if present)] [moov with patched stco/co64] [mdat header] [file data from keyframe offset …]
+    /// The TV receives a fully valid MP4 starting at the requested keyframe.
+    /// Supports Range requests so Samsung's buffering connections get proper 206 responses
+    /// instead of 200, eliminating repeated connect-drop cycles.
+    private static func seekResponse(
+        path: String, mime: String, prelude: MP4SeekParser.SeekPrelude,
+        rangeHeader: String? = nil
+    ) -> HttpResponse {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return .internalServerError }
+
+        // Build the in-memory header region: [ftyp] [moov] [mdat box header (8 bytes)]
+        var headerData = Data()
+        headerData.append(prelude.ftypData)
+        headerData.append(prelude.moovData)
+        var mdatHdr = Data(count: 8)
+        let mdatBoxSize = 8 + prelude.dataLength
+        mdatHdr.writeU32(UInt32(min(mdatBoxSize, UInt64(UInt32.max))), at: 0)
+        mdatHdr[4] = UInt8(ascii: "m"); mdatHdr[5] = UInt8(ascii: "d")
+        mdatHdr[6] = UInt8(ascii: "a"); mdatHdr[7] = UInt8(ascii: "t")
+        headerData.append(mdatHdr)
+
+        let headerSize = UInt64(headerData.count)
+        let totalLength = headerSize + prelude.dataLength
+
+        // Resolve byte range (full content if no Range header).
+        let (rangeStart, rangeEnd) = rangeHeader.map { parseRange($0, fileSize: totalLength) }
+                                     ?? (0, totalLength - 1)
+        let serveLength = rangeEnd - rangeStart + 1
+        let isRange = rangeHeader != nil
+
+        var headers = dlnaHeaders
+        headers["Content-Type"]   = mime
+        headers["Content-Length"] = "\(serveLength)"
+        headers["Accept-Ranges"]  = "bytes"
+        if isRange {
+            headers["Content-Range"] = "bytes \(rangeStart)-\(rangeEnd)/\(totalLength)"
+        }
+
+        return .raw(isRange ? 206 : 200, isRange ? "Partial Content" : "OK", headers) { writer in
+            defer { fh.closeFile() }
+            do {
+                var bytesWritten: UInt64 = 0
+
+                // ── Serve bytes from the in-memory header region ──────────────────
+                if rangeStart < headerSize {
+                    let sliceStart = Int(rangeStart)
+                    let sliceEnd   = Int(min(headerSize - 1, rangeEnd))
+                    try writer.write(Data(headerData[sliceStart...sliceEnd]))
+                    bytesWritten += UInt64(sliceEnd - sliceStart + 1)
+                }
+
+                // ── Serve bytes from the file (video data after the keyframe) ─────
+                if rangeEnd >= headerSize {
+                    let fileRangeStart = max(rangeStart, headerSize)
+                    let fileOffset     = prelude.dataOffset + (fileRangeStart - headerSize)
+                    fh.seek(toFileOffset: fileOffset)
+                    var leftToRead = serveLength - bytesWritten
+                    let chunkSize  = 256 * 1024
+                    while leftToRead > 0 {
+                        let toRead = Int(min(UInt64(chunkSize), leftToRead))
+                        let chunk  = fh.readData(ofLength: toRead)
+                        guard !chunk.isEmpty else { break }
+                        try writer.write(chunk)
+                        leftToRead -= UInt64(chunk.count)
+                    }
+                }
+            } catch {
+                print(">>> HTTPServer seekResponse write error: \(error)")
+            }
+        }
+    }
 
     private static func rangeResponse(
         path: String, fileSize: UInt64, mime: String, rangeHeader: String

@@ -147,18 +147,63 @@ final class DLNAController: ObservableObject {
     }
 
     func seek(to position: TimeInterval) async throws {
+        print(">>> seek() called with position=\(position) transportState=\(transportState)")
         pausePolling()
-        print(">>> seek: from=\(formatTime(currentPosition)) to=\(formatTime(position))")
-        let wasPlaying = transportState == .playing
-        pausedPosition = nil  // discard any fake-pause marker
-        try await sendSeekSOAP(to: position)
-        currentPosition = position
-        // Re-send Play after seek — some renderers pause during the seek operation.
-        if wasPlaying {
+        defer { resumePolling() }
+
+        pausedPosition = nil
+        isPaused = false
+
+        if transportState == .playing || transportState == .paused {
+            // Video is already loaded on the TV — send Seek REL_TIME directly.
+            // Restarting with Stop+SetURI+Play causes Samsung to ignore the subsequent
+            // Seek because the stream hasn't buffered yet at that point.
+            //
+            // Samsung returns 500 on Seek while in PAUSED_PLAYBACK — must resume first.
+            if transportState == .paused {
+                print(">>> seek: resuming from pause before seek")
+                pausedPosition = nil
+                isPaused = false
+                try await sendPlay()
+                transportState = .playing
+                try await waitUntilPlaying()
+            }
+            print(">>> seek: direct Seek REL_TIME to \(formatTime(position))")
+            do {
+                try await sendSeekSOAP(to: position)
+            } catch let error as DLNAError {
+                // 701 means the renderer is still in TRANSITIONING (e.g. re-buffering
+                // after a recent seek). Wait until it reaches PLAYING, then retry once.
+                guard case .soapFault(_, let xml) = error,
+                      xml.contains("<errorCode>701</errorCode>") else { throw error }
+                print(">>> seek: 701 TRANSITIONING — waiting then retrying")
+                try await waitUntilPlaying(timeout: 5.0)
+                try await sendSeekSOAP(to: position)
+            }
+            currentPosition = position
+            print(">>> seek: complete at \(formatTime(position))")
+        } else {
+            // Video not loaded — full Stop → SetURI → Play → wait → Seek cycle.
+            guard let baseURL = currentVideoURL else {
+                print(">>> seek: no currentVideoURL — cannot seek")
+                return
+            }
+            print(">>> seek: Stop → SetURI → Play → Seek REL_TIME  target=\(formatTime(position))")
+            let controlURL = try avTransportURL()
+            try await soap(url: controlURL, service: "AVTransport", action: "Stop",
+                           body: "<InstanceID>0</InstanceID>")
+            try await setAVTransportURI(videoURL: baseURL)
             try await sendPlay()
+            transportState = .playing
+            do {
+                try await waitUntilPlaying()
+                try await sendSeekSOAP(to: position)
+                currentPosition = position
+                print(">>> seek: complete at \(formatTime(position))")
+            } catch {
+                print(">>> seek: Seek SOAP failed (\(error)) — playing from start")
+            }
         }
-        print(">>> seek: complete — position=\(formatTime(position))")
-        resumePolling()
     }
 
     // MARK: - Seek diagnostic
@@ -329,24 +374,14 @@ final class DLNAController: ObservableObject {
         request.setValue("\"\(urn)#\(action)\"", forHTTPHeaderField: "SOAPACTION")
         request.httpBody = envelope.data(using: .utf8)
 
-        print("""
-        ── SOAP REQUEST ───────────────────────────────────────────
-        \(action) → \(url)
-        SOAPACTION: "\(urn)#\(action)"
-        \(envelope)
-        ───────────────────────────────────────────────────────────
-        """)
-
         let (data, response) = try await URLSession.shared.data(for: request)
         let responseBody = String(data: data, encoding: .utf8) ?? "<non-UTF8 body>"
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-        print("""
-        ── SOAP RESPONSE ──────────────────────────────────────────
-        \(action) ← HTTP \(statusCode)
-        \(responseBody)
-        ───────────────────────────────────────────────────────────
-        """)
+        let isPolling = action == "GetPositionInfo" || action == "GetTransportInfo"
+        if !isPolling {
+            print(">>> SOAP \(action) → HTTP \(statusCode)  \(responseBody.prefix(600))")
+        }
 
         guard let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode) else {
@@ -359,7 +394,7 @@ final class DLNAController: ObservableObject {
 
     private func formatTime(_ seconds: TimeInterval) -> String {
         let total = Int(max(0, seconds))
-        return String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+        return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
     }
 
     private func parseTime(_ string: String) -> TimeInterval {

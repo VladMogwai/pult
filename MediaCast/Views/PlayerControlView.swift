@@ -7,13 +7,22 @@ struct PlayerControlView: View {
     let selectedVideo: URL?
     let selectedDevice: UPnPDevice?
 
+    /// Set by SearchView when it resolves a stream. Cleared after cast starts.
+    @Binding var pendingCastURL: URL?
+    @Binding var pendingCastTitle: String?
+
     @State private var isCasting = false
     @State private var errorMessage: String?
     @State private var isSeeking = false
     @State private var seekPosition: Double = 0
 
     private var isPlaying: Bool { dlna.transportState == .playing }
-    private var isReadyToCast: Bool { selectedVideo != nil && selectedDevice != nil }
+    private var isReadyToCast: Bool {
+        selectedDevice != nil && (selectedVideo != nil || pendingCastURL != nil)
+    }
+    private var currentTitle: String {
+        pendingCastTitle ?? selectedVideo?.lastPathComponent ?? "No content selected"
+    }
 
     var body: some View {
         NavigationView {
@@ -53,13 +62,13 @@ struct PlayerControlView: View {
                     .foregroundStyle(selectedDevice != nil ? .primary : .secondary)
             }
 
-            // File row
+            // Content row
             HStack {
-                Image(systemName: "film")
-                    .foregroundStyle(selectedVideo != nil ? .blue : .secondary)
-                Text(selectedVideo?.lastPathComponent ?? "No file selected")
+                Image(systemName: pendingCastURL != nil ? "magnifyingglass.circle.fill" : "film")
+                    .foregroundStyle((selectedVideo != nil || pendingCastURL != nil) ? .blue : .secondary)
+                Text(currentTitle)
                     .font(.subheadline)
-                    .foregroundStyle(selectedVideo != nil ? .primary : .secondary)
+                    .foregroundStyle((selectedVideo != nil || pendingCastURL != nil) ? .primary : .secondary)
                     .lineLimit(1)
             }
 
@@ -142,7 +151,7 @@ struct PlayerControlView: View {
                 print(">>> SEEK TAPPED to \(target)s (rewind) — currentVideoURL=\(dlna.currentVideoURL?.absoluteString ?? "nil")")
                 Task {
                     do { try await dlna.seek(to: target) }
-                    catch { print(">>> SEEK ERROR: \(error)") }
+                    catch { errorMessage = error.localizedDescription }
                 }
             }
 
@@ -175,11 +184,13 @@ struct PlayerControlView: View {
 
             // Forward 30 s
             IconButton(name: "goforward.30", size: 26) {
-                let target = min(dlna.currentPosition + 30, dlna.duration)
+                let target = dlna.duration > 0
+                    ? min(dlna.currentPosition + 30, dlna.duration)
+                    : dlna.currentPosition + 30
                 print(">>> SEEK TAPPED to \(target)s (forward) — currentVideoURL=\(dlna.currentVideoURL?.absoluteString ?? "nil")")
                 Task {
                     do { try await dlna.seek(to: target) }
-                    catch { print(">>> SEEK ERROR: \(error)") }
+                    catch { errorMessage = error.localizedDescription }
                 }
             }
 
@@ -244,20 +255,32 @@ struct PlayerControlView: View {
     // MARK: - Actions
 
     private func startCasting() async {
-        guard let video = selectedVideo, let device = selectedDevice else { return }
+        guard let device = selectedDevice else { return }
 
         isCasting = true
         defer { isCasting = false }
 
         do {
-            guard let videoURL = httpServer.addVideo(at: video) else {
-                errorMessage = "Could not determine your local IP address. Make sure Wi-Fi is on."
+            // Prefer pending stream URL from Search; fall back to local file.
+            let castURL: URL
+            if let streamURL = pendingCastURL {
+                castURL = streamURL
+            } else if let video = selectedVideo {
+                guard let localURL = httpServer.addVideo(at: video) else {
+                    errorMessage = "Could not determine your local IP address. Make sure Wi-Fi is on."
+                    return
+                }
+                castURL = localURL
+            } else {
                 return
             }
 
             dlna.selectDevice(device)
-            try await dlna.setAVTransportURI(videoURL: videoURL)
+            try await dlna.setAVTransportURI(videoURL: castURL)
             try await dlna.play()
+
+            // Clear pending after successful cast so the button doesn't re-cast on re-entry.
+            pendingCastURL = nil
         } catch {
             errorMessage = error.localizedDescription
         }
