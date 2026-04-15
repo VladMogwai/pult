@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- Required: permission prompt shown when the app first tries to
+         enumerate or communicate with devices on the local network. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>MediaCast discovers DLNA/UPnP renderers on your local Wi-Fi to stream video to your TV.</string>
+
+    <!-- Bonjour service types let the OS show the permission prompt
+         at the right time and satisfy App Store review. -->
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_ssdp._udp</string>
+        <string>_upnp._tcp</string>
+        <string>_http._tcp</string>
+    </array>
+
+    <!-- Allow plain HTTP to local network hosts (TV control + self-hosted
+         video server both use http://). -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+
+    <!-- Standard iOS keys -->
+    <key>UILaunchScreen</key>
+    <dict/>
+
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+
+    <key>UIRequiresFullScreen</key>
+    <false/>
+
+</dict>
+</plist>
