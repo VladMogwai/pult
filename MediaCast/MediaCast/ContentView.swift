@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var ssdp = SSDPDiscovery()
@@ -7,64 +8,83 @@ struct ContentView: View {
 
     @State private var selectedDevice: UPnPDevice?
     @State private var selectedVideo: URL?
+    @State private var castingTitle: String = ""
+    @State private var showCastControls = false
 
-    // Set by SearchView when the user resolves + picks a stream.
-    // PlayerControlView watches these to start casting.
-    @State private var pendingCastURL: URL?
-    @State private var pendingCastTitle: String?
-    @State private var selectedTab = 0
+    @AppStorage("auto_connect") private var autoConnect = false
+
+    private var isCasting: Bool {
+        dlna.transportState != .noMediaPresent && dlna.transportState != .stopped
+    }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            DeviceListView(ssdp: ssdp, selectedDevice: $selectedDevice)
-                .tabItem { Label("Devices", systemImage: "tv") }
-                .tag(0)
+        ZStack(alignment: .bottom) {
+            TabView {
+                HomeView(
+                    httpServer: httpServer,
+                    dlna: dlna,
+                    selectedDevice: selectedDevice,
+                    castingTitle: $castingTitle
+                )
+                .tabItem { Label("Главная", systemImage: "house") }
 
-            FilePickerView(selectedVideo: $selectedVideo, httpServer: httpServer)
+                FilePickerView(
+                    selectedVideo: $selectedVideo,
+                    httpServer: httpServer,
+                    dlna: dlna,
+                    selectedDevice: $selectedDevice,
+                    castingTitle: $castingTitle
+                )
                 .tabItem { Label("Files", systemImage: "folder") }
-                .tag(1)
 
-            SearchView(
-                httpServer: httpServer,
-                pendingCastURL: $pendingCastURL,
-                pendingCastTitle: $pendingCastTitle
-            )
-            .tabItem { Label("Search", systemImage: "magnifyingglass") }
-            .tag(2)
+                SettingsView(ssdp: ssdp, selectedDevice: $selectedDevice)
+                    .tabItem { Label("Настройки", systemImage: "gear") }
+            }
+            .tint(Theme.accent)
+            .preferredColorScheme(.dark)
+            .background(Theme.bgPrimary.ignoresSafeArea())
 
-            PlayerControlView(
-                dlna: dlna,
-                httpServer: httpServer,
-                selectedVideo: selectedVideo,
-                selectedDevice: selectedDevice,
-                pendingCastURL: $pendingCastURL,
-                pendingCastTitle: $pendingCastTitle
-            )
-            .tabItem { Label("Remote", systemImage: "play.rectangle") }
-            .tag(3)
-
-            SettingsView()
-                .tabItem { Label("Settings", systemImage: "gear") }
-                .tag(4)
+            // Floating cast bar — appears above the tab bar while casting
+            if isCasting {
+                CastBar(dlna: dlna, title: castingTitle) {
+                    showCastControls = true
+                }
+                .padding(.bottom, 54)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(duration: 0.3), value: isCasting)
+        .sheet(isPresented: $showCastControls) {
+            CastControlSheet(dlna: dlna, title: castingTitle, isPresented: $showCastControls)
         }
         .onAppear {
             ssdp.startDiscovery()
             try? httpServer.start()
+            UITabBar.appearance().barTintColor = UIColor(Theme.bgPrimary)
+            UITabBar.appearance().backgroundColor = UIColor(Theme.bgPrimary)
+            UITabBar.appearance().unselectedItemTintColor = UIColor(Theme.textMuted)
         }
         .onDisappear {
             ssdp.stopDiscovery()
             httpServer.stop()
             dlna.stopPolling()
         }
-        .onChange(of: selectedDevice) { (_: UPnPDevice?, device: UPnPDevice?) in
+        .onChange(of: selectedDevice) { _, device in
             if let device {
                 dlna.selectDevice(device)
                 ssdp.stopAllScanning()
+                UserDefaults.standard.set(device.location, forKey: "last_device_location")
+                UserDefaults.standard.set(device.friendlyName, forKey: "last_device_name")
             }
         }
-        // Auto-switch to Remote tab when Search resolves a stream.
-        .onChange(of: pendingCastURL) { _, url in
-            if url != nil { selectedTab = 3 }
+        // Auto-connect: when a previously connected device is discovered, select it
+        .onChange(of: ssdp.devices) { _, devices in
+            guard autoConnect, selectedDevice == nil else { return }
+            let lastLoc = UserDefaults.standard.string(forKey: "last_device_location") ?? ""
+            guard !lastLoc.isEmpty else { return }
+            if let match = devices.first(where: { $0.location == lastLoc }) {
+                selectedDevice = match
+            }
         }
     }
 }

@@ -110,8 +110,8 @@ final class HTTPServer: ObservableObject {
             }
         }
 
-        // CDN proxy: TV requests /proxy/<id> → phone fetches from CDN with stored headers.
-        // Samsung sends Range requests (small chunks), so buffering per request is fine.
+        // SEEK FIX: Replace buffered dataTask with URLSessionDataDelegate so CDN errors,
+        // HTTP/2 lowercase headers, and non-206 status codes are propagated correctly.
         server["/proxy/:proxyId"] = { [proxyLock, weak self] request in
             guard let self else { return .notFound }
             let proxyId = request.params[":proxyId"] ?? ""
@@ -125,41 +125,123 @@ final class HTTPServer: ObservableObject {
                 cdnReq.setValue(range, forHTTPHeaderField: "Range")
             }
 
-            let sem = DispatchSemaphore(value: 0)
-            var cdnStatus = 200
-            var cdnHeaders: [String: String] = [:]
-            var cdnData = Data()
+            // SEEK FIX: Delegate-based session surfaces errors as non-200 status codes
+            // instead of silently returning 200 OK with an empty body.
+            let collector = CDNResponseCollector()
+            let session = URLSession(configuration: .ephemeral, delegate: collector, delegateQueue: nil)
+            session.dataTask(with: cdnReq).resume()
 
-            URLSession.shared.dataTask(with: cdnReq) { data, response, _ in
-                if let http = response as? HTTPURLResponse {
-                    cdnStatus = http.statusCode
-                    for (k, v) in http.allHeaderFields {
-                        if let key = k as? String, let val = v as? String {
-                            cdnHeaders[key] = val
-                        }
-                    }
-                }
-                cdnData = data ?? Data()
-                sem.signal()
-            }.resume()
-            sem.wait()
+            // SEEK FIX: Return 504 if CDN doesn't respond in time rather than hanging forever.
+            guard collector.awaitHeaders(timeout: 15) else {
+                session.invalidateAndCancel()
+                return .raw(504, "Gateway Timeout", [:]) { _ in }
+            }
 
-            // Pass through only safe headers; always add DLNA streaming hints.
+            let cdnStatus  = collector.statusCode
+            // SEEK FIX: All header keys are lowercased so HTTP/2 headers are found correctly.
+            let cdnHeaders = collector.normalizedHeaders
+
             var outHeaders = Self.dlnaHeaders
-            outHeaders["Content-Type"]   = cdnHeaders["Content-Type"]  ?? "video/mp4"
-            outHeaders["Content-Length"] = cdnHeaders["Content-Length"] ?? "\(cdnData.count)"
-            outHeaders["Accept-Ranges"]  = "bytes"
-            if let cr = cdnHeaders["Content-Range"] { outHeaders["Content-Range"] = cr }
+            outHeaders["Content-Type"]  = cdnHeaders["content-type"] ?? "video/mp4"
+            outHeaders["Accept-Ranges"] = "bytes"
+            // SEEK FIX: content-length was silently dropped because HTTP/2 sends it lowercase.
+            if let cl = cdnHeaders["content-length"] { outHeaders["Content-Length"] = cl }
+            // SEEK FIX: content-range is required so Samsung can compute seek byte offsets.
+            if let cr = cdnHeaders["content-range"]  { outHeaders["Content-Range"]  = cr }
 
-            let statusMsg = cdnStatus == 206 ? "Partial Content" : "OK"
-            let captured = cdnData
-            return .raw(cdnStatus, statusMsg, outHeaders) { writer in
-                try? writer.write(captured)
+            // SEEK FIX: Return the real CDN status code and a matching reason phrase
+            // instead of always returning "OK" for non-206 responses.
+            return .raw(cdnStatus, Self.reasonPhrase(cdnStatus), outHeaders) { writer in
+                collector.awaitBodyAndWrite(to: writer)
+                session.finishTasksAndInvalidate()
             }
         }
     }
 
+    // MARK: - CDN response collector
+
+    /// Two-phase URLSessionDataDelegate:
+    ///   Phase 1 — captures status code + headers, signals headersSem.
+    ///   Phase 2 — accumulates body chunks; signals doneSem on completion.
+    ///
+    /// SEEK FIX: Replaces the old dataTask completion handler that (a) ignored the
+    /// error parameter, (b) did case-sensitive header lookup that missed HTTP/2 lowercase
+    /// keys, and (c) returned "OK" as the reason phrase for every non-206 response.
+    private final class CDNResponseCollector: NSObject, URLSessionDataDelegate {
+        private let headersSem = DispatchSemaphore(value: 0)
+        private let doneSem    = DispatchSemaphore(value: 0)
+        private let lock       = NSLock()
+
+        private(set) var statusCode: Int = 502
+        /// All header names are lowercased so HTTP/2 headers are found correctly.
+        private(set) var normalizedHeaders: [String: String] = [:]
+        private var bodyChunks: [Data] = []
+        private var headersSignalled = false
+
+        func urlSession(_ session: URLSession,
+                        dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            if let http = response as? HTTPURLResponse {
+                statusCode = http.statusCode
+                for (k, v) in http.allHeaderFields {
+                    if let key = k as? String, let val = v as? String {
+                        normalizedHeaders[key.lowercased()] = val
+                    }
+                }
+            }
+            lock.withLock {
+                if !headersSignalled { headersSignalled = true; headersSem.signal() }
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            lock.withLock { bodyChunks.append(data) }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error { print(">>> CDN proxy error: \(error)") }
+            // Signal headers if the request failed before any response arrived.
+            lock.withLock {
+                if !headersSignalled { headersSignalled = true; headersSem.signal() }
+            }
+            doneSem.signal()
+        }
+
+        /// Returns false on timeout (CDN did not respond within `timeout` seconds).
+        func awaitHeaders(timeout: TimeInterval) -> Bool {
+            headersSem.wait(timeout: .now() + timeout) == .success
+        }
+
+        /// Blocks until the CDN transfer completes, then writes all body data to `writer`.
+        func awaitBodyAndWrite(to writer: HttpResponseBodyWriter) {
+            doneSem.wait()
+            let chunks = lock.withLock { bodyChunks }
+            for chunk in chunks { try? writer.write(chunk) }
+        }
+    }
+
     // MARK: - Response helpers
+
+    private static func reasonPhrase(_ code: Int) -> String {
+        switch code {
+        case 200: return "OK"
+        case 206: return "Partial Content"
+        case 301: return "Moved Permanently"
+        case 302: return "Found"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 416: return "Range Not Satisfiable"
+        case 500: return "Internal Server Error"
+        case 502: return "Bad Gateway"
+        case 503: return "Service Unavailable"
+        case 504: return "Gateway Timeout"
+        default:  return "Unknown"
+        }
+    }
 
     /// Headers required by Samsung (and DLNA-compliant renderers) to enable the seek bar
     /// and transport controls. DLNA.ORG_OP=01 advertises byte-seek support.

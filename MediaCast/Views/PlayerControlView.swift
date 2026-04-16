@@ -26,18 +26,25 @@ struct PlayerControlView: View {
 
     var body: some View {
         NavigationView {
-            ScrollView {
-                VStack(spacing: 28) {
-                    statusCard
-                    if dlna.duration > 1 { seekBar }
-                    transportControls
-                    volumeControl
-                    if isReadyToCast { castButton }
-                    debugText
+            ZStack {
+                Theme.bgPrimary.ignoresSafeArea()
+
+                ScrollView {
+                    VStack(spacing: 20) {
+                        statusCard
+                        if dlna.duration > 1 { seekBar }
+                        transportControls
+                        volumeControl
+                        if isReadyToCast { castButton }
+                        debugText
+                    }
+                    .padding()
                 }
-                .padding()
             }
             .navigationTitle("Remote")
+            .toolbarBackground(Theme.bgSecondary, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
             .alert("Playback Error", isPresented: .init(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } }
@@ -52,47 +59,70 @@ struct PlayerControlView: View {
     // MARK: - Status card
 
     private var statusCard: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 12) {
             // Device row
-            HStack {
-                Image(systemName: "tv.fill")
-                    .foregroundStyle(selectedDevice != nil ? .blue : .secondary)
-                Text(selectedDevice?.friendlyName ?? "No device selected")
-                    .font(.headline)
-                    .foregroundStyle(selectedDevice != nil ? .primary : .secondary)
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(selectedDevice != nil ? Theme.castActiveBg : Theme.bgTertiary)
+                        .frame(width: 56, height: 56)
+                    Image(systemName: "tv.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(selectedDevice != nil ? Theme.castActive : Theme.textMuted)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(selectedDevice?.friendlyName ?? "No device selected")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(selectedDevice != nil ? Theme.textPrimary : Theme.textSecondary)
+                    Text("Подключено · DLNA/UPnP")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.textMuted)
+                }
+                Spacer()
             }
 
+            Divider().background(Theme.borderSubtle)
+
             // Content row
-            HStack {
+            HStack(spacing: 10) {
                 Image(systemName: pendingCastURL != nil ? "magnifyingglass.circle.fill" : "film")
-                    .foregroundStyle((selectedVideo != nil || pendingCastURL != nil) ? .blue : .secondary)
+                    .font(.system(size: 16))
+                    .foregroundStyle((selectedVideo != nil || pendingCastURL != nil) ? Theme.accent : Theme.textMuted)
                 Text(currentTitle)
-                    .font(.subheadline)
-                    .foregroundStyle((selectedVideo != nil || pendingCastURL != nil) ? .primary : .secondary)
+                    .font(.system(size: 13))
+                    .foregroundStyle((selectedVideo != nil || pendingCastURL != nil) ? Theme.textPrimary : Theme.textSecondary)
                     .lineLimit(1)
+                Spacer()
             }
 
             // State badge
             Text(dlna.transportState.displayName)
-                .font(.caption.weight(.medium))
+                .font(.system(size: 12, weight: .semibold))
                 .padding(.horizontal, 14)
                 .padding(.vertical, 5)
                 .background(stateColor.opacity(0.15))
                 .foregroundStyle(stateColor)
                 .clipShape(Capsule())
         }
-        .padding()
+        .padding(16)
         .frame(maxWidth: .infinity)
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(16)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Theme.bgSecondary)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(Theme.borderSubtle, lineWidth: 0.5)
+                )
+        )
     }
 
     private var stateColor: Color {
         switch dlna.transportState {
-        case .playing: return .green
-        case .paused: return .orange
-        case .stopped, .noMediaPresent: return .red
-        case .transitioning: return .blue
+        case .playing:        return Theme.castActive
+        case .paused:         return Color(hex: "#FF9F00")
+        case .transitioning:  return Theme.accent
+        case .stopped, .noMediaPresent: return Theme.danger
         }
     }
 
@@ -121,6 +151,8 @@ struct PlayerControlView: View {
                     }
                 }
             )
+            .tint(Theme.accent)
+
             HStack {
                 Text(formatTime(isSeeking ? seekPosition : dlna.currentPosition))
                     .monospacedDigit()
@@ -128,8 +160,8 @@ struct PlayerControlView: View {
                 Text(formatTime(dlna.duration))
                     .monospacedDigit()
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .font(.system(size: 11))
+            .foregroundStyle(Theme.textSecondary)
         }
     }
 
@@ -138,7 +170,7 @@ struct PlayerControlView: View {
     private var transportControls: some View {
         HStack(spacing: 44) {
             // Stop
-            IconButton(name: "stop.fill", size: 26) {
+            IconButton(name: "stop.fill", size: 22, tint: Theme.textMuted) {
                 Task {
                     do { try await dlna.stop() }
                     catch { errorMessage = error.localizedDescription }
@@ -146,7 +178,7 @@ struct PlayerControlView: View {
             }
 
             // Rewind 10 s
-            IconButton(name: "gobackward.10", size: 26) {
+            IconButton(name: "gobackward.10", size: 22, tint: Theme.textMuted) {
                 let target = max(0, dlna.currentPosition - 10)
                 print(">>> SEEK TAPPED to \(target)s (rewind) — currentVideoURL=\(dlna.currentVideoURL?.absoluteString ?? "nil")")
                 Task {
@@ -155,15 +187,13 @@ struct PlayerControlView: View {
                 }
             }
 
-            // Play / Pause (big)
+            // Play / Pause (big circle button)
             if isCasting {
-                ProgressView().frame(width: 64, height: 64)
+                ProgressView()
+                    .tint(Theme.accent)
+                    .frame(width: 48, height: 48)
             } else {
-                IconButton(
-                    name: isPlaying ? "pause.circle.fill" : "play.circle.fill",
-                    size: 64,
-                    tint: .blue
-                ) {
+                Button {
                     print(">>> TOGGLE TAPPED, isPaused=\(dlna.isPaused), transportState=\(dlna.transportState), isPlaying=\(isPlaying)")
                     Task {
                         do {
@@ -179,11 +209,21 @@ struct PlayerControlView: View {
                             errorMessage = error.localizedDescription
                         }
                     }
+                } label: {
+                    ZStack {
+                        Circle()
+                            .fill(Theme.accent)
+                            .frame(width: 48, height: 48)
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 20))
+                            .foregroundStyle(.white)
+                    }
                 }
+                .buttonStyle(.plain)
             }
 
             // Forward 30 s
-            IconButton(name: "goforward.30", size: 26) {
+            IconButton(name: "goforward.30", size: 22, tint: Theme.textMuted) {
                 let target = dlna.duration > 0
                     ? min(dlna.currentPosition + 30, dlna.duration)
                     : dlna.currentPosition + 30
@@ -195,7 +235,7 @@ struct PlayerControlView: View {
             }
 
             // Placeholder to balance layout
-            Color.clear.frame(width: 26, height: 26)
+            Color.clear.frame(width: 22, height: 22)
         }
     }
 
@@ -204,7 +244,7 @@ struct PlayerControlView: View {
     private var volumeControl: some View {
         HStack(spacing: 12) {
             Image(systemName: "speaker.fill")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.textMuted)
                 .frame(width: 22)
 
             Slider(
@@ -216,22 +256,29 @@ struct PlayerControlView: View {
                 ),
                 in: 0...100
             )
+            .tint(Theme.accent)
 
             Image(systemName: "speaker.wave.3.fill")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Theme.textMuted)
                 .frame(width: 22)
         }
-        .padding()
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(14)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Theme.bgSecondary)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(Theme.borderSubtle, lineWidth: 0.5)
+                )
+        )
     }
 
     // MARK: - Debug info
 
     private var debugText: some View {
         Text("transportState: \(dlna.transportState.rawValue)  |  isPaused: \(dlna.isPaused ? "true" : "false")")
-            .font(.caption2)
-            .foregroundStyle(.secondary)
+            .font(.system(size: 11))
+            .foregroundStyle(Theme.textMuted)
             .multilineTextAlignment(.center)
     }
 
@@ -241,13 +288,23 @@ struct PlayerControlView: View {
         Button {
             Task { await startCasting() }
         } label: {
-            Label("Cast to TV", systemImage: "airplayvideo")
-                .frame(maxWidth: .infinity)
-                .padding()
-                .background(Color.blue)
-                .foregroundStyle(.white)
-                .cornerRadius(14)
-                .font(.headline)
+            HStack(spacing: 9) {
+                if isCasting {
+                    ProgressView().tint(.white).scaleEffect(0.85)
+                } else {
+                    Image(systemName: "airplayvideo")
+                        .font(.system(size: 15))
+                }
+                Text(isCasting ? "Connecting…" : "Cast to TV")
+                    .font(.system(size: 15, weight: .semibold))
+            }
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(isCasting ? Theme.accentDim : Theme.accent)
+            )
         }
         .disabled(isCasting)
     }
@@ -261,7 +318,6 @@ struct PlayerControlView: View {
         defer { isCasting = false }
 
         do {
-            // Prefer pending stream URL from Search; fall back to local file.
             let castURL: URL
             if let streamURL = pendingCastURL {
                 castURL = streamURL
@@ -279,7 +335,6 @@ struct PlayerControlView: View {
             try await dlna.setAVTransportURI(videoURL: castURL)
             try await dlna.play()
 
-            // Clear pending after successful cast so the button doesn't re-cast on re-entry.
             pendingCastURL = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -304,7 +359,7 @@ struct PlayerControlView: View {
 private struct IconButton: View {
     let name: String
     var size: CGFloat = 28
-    var tint: Color = .primary
+    var tint: Color = Theme.textMuted
     let action: () -> Void
 
     var body: some View {
