@@ -29,13 +29,22 @@ final class APIClient {
 
     // MARK: - Info
 
-    func info(url: String) async throws -> InfoResponse {
+    func info(url: String, translatorId: String? = nil) async throws -> InfoResponse {
         guard let base = validBase() else { throw APIError.noBaseURL }
         var req = makeRequest(url: URL(string: "\(base)/api/info")!)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONEncoder().encode(["url": url])
-        return try await perform(req)
+        var body: [String: String] = ["url": url]
+        if let t = translatorId { body["translatorId"] = t }
+        req.httpBody = try JSONEncoder().encode(body)
+        let result: InfoResponse = try await perform(req)
+        let totalEpisodes = result.seasons?.flatMap(\.episodes).count ?? 0
+        let translatorNames = result.translators?.map(\.name).joined(separator: ", ") ?? "none"
+        let seasonIds = result.seasons?.map(\.id).joined(separator: ",") ?? "none"
+        print("[MC-DIAG] APIClient.info url=\(url)")
+        print("[MC-DIAG]   type=\(result.type) translators=\(result.translators?.count ?? 0) [\(translatorNames)]")
+        print("[MC-DIAG]   seasons=\(result.seasons?.count ?? 0) [\(seasonIds)] totalEpisodes=\(totalEpisodes)")
+        return result
     }
 
     // MARK: - Resolve

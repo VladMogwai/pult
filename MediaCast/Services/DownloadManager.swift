@@ -30,6 +30,21 @@ final class DownloadManager: NSObject, ObservableObject {
     // Active HLS download tasks (key → Task)
     private var hlsDownloadTasks: [String: Task<Void, Never>] = [:]
 
+    // Security-scoped URL for the custom download directory chosen via Files picker.
+    // nonisolated(unsafe) because downloadDirectoryURL is called from nonisolated delegate code.
+    // Written only in init() and setDownloadDirectory() — both on MainActor before any concurrent use.
+    nonisolated(unsafe) private var _scopedDirectoryURL: URL?
+
+    // Dedicated URLSession for HLS segments — separate from mp4Session and URLSession.shared
+    private let hlsSession: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 30
+        cfg.timeoutIntervalForResource = 3600
+        cfg.httpMaximumConnectionsPerHost = 8
+        cfg.networkServiceType = .responsiveData
+        return URLSession(configuration: cfg)
+    }()
+
     // MARK: - Queries
 
     func isDownloaded(key: String) -> Bool { localURL(for: key) != nil }
@@ -37,8 +52,37 @@ final class DownloadManager: NSObject, ObservableObject {
 
     func localURL(for key: String) -> URL? {
         guard let e = entries[key], !e.localPath.isEmpty else { return nil }
-        let url = URL(fileURLWithPath: e.localPath)
-        return FileManager.default.fileExists(atPath: e.localPath) ? url : nil
+        // resolvingSymlinksInPath converts /var/mobile/... → /private/var/mobile/... so that
+        // checkResourceIsReachable (and file I/O) works correctly across app restarts.
+        // URL.path does NOT resolve symlinks — storing /var/ paths and reading them back
+        // without this call causes false-negative reachability checks on iOS.
+        let url = URL(fileURLWithPath: e.localPath).resolvingSymlinksInPath()
+        let reachable = (try? url.checkResourceIsReachable()) == true
+        let fileExists = FileManager.default.fileExists(atPath: e.localPath)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = attrs?[.size] as? Int64 ?? -1
+        print("[MC-DL-DIAG] localURL key=\(key.suffix(40))")
+        print("[MC-DL-DIAG]   storedPath=\(e.localPath)")
+        print("[MC-DL-DIAG]   resolvedPath=\(url.path)")
+        print("[MC-DL-DIAG]   fileExists(storedPath)=\(fileExists) reachable(resolvedPath)=\(reachable) size=\(fileSize)")
+        DownloadManager.logResourceValues(url: url, prefix: "  localURL")
+        return reachable ? url : nil
+    }
+
+    /// Logs URLResourceValues for H2.5 (iCloud offload), data-protection, readability.
+    static func logResourceValues(url: URL, prefix: String) {
+        let keys: Set<URLResourceKey> = [
+            .fileSizeKey, .isReadableKey,
+            .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey,
+        ]
+        let vals = try? url.resourceValues(forKeys: keys)
+        let ubiq    = vals?.isUbiquitousItem ?? false
+        let dlStatus = vals?.ubiquitousItemDownloadingStatus?.rawValue ?? "n/a"
+        let readable = vals?.isReadable ?? false
+        let size     = vals?.fileSize ?? -1
+        print("[MC-DL-DIAG]\(prefix) resourceValues: size=\(size) readable=\(readable) ubiquitous=\(ubiq) iCloudStatus=\(dlStatus)")
+        let prot = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.protectionKey] as? FileProtectionType
+        print("[MC-DL-DIAG]\(prefix) protectionKey=\(prot?.rawValue ?? "nil")")
     }
 
     func entry(for key: String) -> DownloadEntry? { entries[key] }
@@ -131,7 +175,7 @@ final class DownloadManager: NSObject, ObservableObject {
         do {
             // 1. Download master manifest
             print(">>> DM: fetching manifest \(manifestURL)")
-            let (manifestData, _) = try await URLSession.shared.data(from: manifestURL)
+            let (manifestData, _) = try await hlsSession.data(from: manifestURL)
             guard let manifest = String(data: manifestData, encoding: .utf8) else {
                 throw NSError(domain: "HLS", code: 0, userInfo: [NSLocalizedDescriptionKey: "Не удалось прочитать манифест"])
             }
@@ -152,7 +196,7 @@ final class DownloadManager: NSObject, ObservableObject {
             }
 
             // 3. Download media playlist
-            let (mediaData, _) = try await URLSession.shared.data(from: playlistURL)
+            let (mediaData, _) = try await hlsSession.data(from: playlistURL)
             guard let mediaManifest = String(data: mediaData, encoding: .utf8) else {
                 throw NSError(domain: "HLS", code: 2, userInfo: [NSLocalizedDescriptionKey: "Не удалось прочитать медиа-манифест"])
             }
@@ -173,39 +217,60 @@ final class DownloadManager: NSObject, ObservableObject {
             print(">>> DM: \(segmentURLs.count) segments to download")
 
             // 5. Prepare output file
-            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let dir = DownloadManager.shared.downloadDirectoryURL
             let safe = title
                 .components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|"))
                 .joined(separator: "_")
             let filename = "\(abs(key.hashValue))_\(safe.prefix(30))_\(quality.quality).ts"
-            let dest = docs.appendingPathComponent(filename)
+            let dest = dir.appendingPathComponent(filename)
             if FileManager.default.fileExists(atPath: dest.path) {
                 try FileManager.default.removeItem(at: dest)
             }
             FileManager.default.createFile(atPath: dest.path, contents: nil)
             let handle = try FileHandle(forWritingTo: dest)
 
-            // 6. Download segments and append
+            // 6. Download segments in parallel batches (8 concurrent), write in order
+            let batchSize = 8
+            let session = hlsSession
             var totalBytes: Int64 = 0
-            for (i, segURL) in segmentURLs.enumerated() {
-                if Task.isCancelled { break }
-                let (segData, _) = try await URLSession.shared.data(from: segURL)
-                try handle.write(contentsOf: segData)
-                totalBytes += Int64(segData.count)
+            var segIndex = 0
 
-                let pct = Double(i + 1) / Double(segmentURLs.count)
+            while segIndex < segmentURLs.count {
+                if Task.isCancelled { break }
+                let batchEnd = min(segIndex + batchSize, segmentURLs.count)
+                let batchURLs = Array(segmentURLs[segIndex..<batchEnd])
+
+                let batchResults: [(Int, Data)] = try await withThrowingTaskGroup(of: (Int, Data).self) { group in
+                    for (i, url) in batchURLs.enumerated() {
+                        group.addTask {
+                            let (data, _) = try await session.data(from: url)
+                            return (i, data)
+                        }
+                    }
+                    var results = [(Int, Data)]()
+                    results.reserveCapacity(batchURLs.count)
+                    for try await item in group { results.append(item) }
+                    return results
+                }
+
+                for (_, data) in batchResults.sorted(by: { $0.0 < $1.0 }) {
+                    try handle.write(contentsOf: data)
+                    totalBytes += Int64(data.count)
+                }
+
+                segIndex = batchEnd
+                let pct = Double(segIndex) / Double(segmentURLs.count)
                 await MainActor.run { [weak self] in
                     self?.progress[key] = pct
                     self?.bytesLoaded[key] = totalBytes
                 }
-                if i % 10 == 0 {
-                    print(">>> DM: seg \(i+1)/\(segmentURLs.count) (\(Int(pct*100))%) \(String(format: "%.1f", Double(totalBytes)/1_048_576))MB")
-                }
+                print(">>> DM: seg \(segIndex)/\(segmentURLs.count) (\(Int(pct*100))%) \(String(format: "%.1f", Double(totalBytes)/1_048_576))MB")
             }
             try handle.close()
 
             let entry = DownloadEntry(key: key, title: title, quality: quality.quality,
-                                      localPath: dest.path, savedAt: Date(), isHLS: true)
+                                      localPath: dest.resolvingSymlinksInPath().path,
+                                      savedAt: Date(), isHLS: true)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.entries[key] = entry
@@ -243,6 +308,86 @@ final class DownloadManager: NSObject, ObservableObject {
         persist()
     }
 
+    // MARK: - Download directory
+
+    /// Resolved download folder. Falls back to app Documents if bookmark is stale/missing.
+    /// nonisolated — only reads UserDefaults + FileManager, both thread-safe.
+    nonisolated var downloadDirectoryURL: URL {
+        // Return the already-scoped URL while the security scope is active.
+        if let scoped = _scopedDirectoryURL { return scoped }
+        // Scope not yet started (e.g. called before init completes) — resolve bookmark raw.
+        if let data = UserDefaults.standard.data(forKey: "dm_folder_bookmark") {
+            var stale = false
+            if let url = try? URL(resolvingBookmarkData: data,
+                                  options: .withoutUI,
+                                  relativeTo: nil,
+                                  bookmarkDataIsStale: &stale),
+               !stale {
+                return url
+            }
+        }
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    var downloadDirectoryDisplayPath: String {
+        let url = downloadDirectoryURL
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        if url.path == docs.path { return "На iPhone / MediaCast" }
+        return url.lastPathComponent
+    }
+
+    func setDownloadDirectory(_ url: URL) {
+        // Release any previously held scope.
+        _scopedDirectoryURL?.stopAccessingSecurityScopedResource()
+        _scopedDirectoryURL = nil
+
+        // Scope 1: needed to create the bookmark.
+        let accessingForBookmark = url.startAccessingSecurityScopedResource()
+        if let bookmark = try? url.bookmarkData(options: .minimalBookmark,
+                                                includingResourceValuesForKeys: nil,
+                                                relativeTo: nil) {
+            UserDefaults.standard.set(bookmark, forKey: "dm_folder_bookmark")
+        }
+        if accessingForBookmark { url.stopAccessingSecurityScopedResource() }
+
+        // Scope 2: held open for this session so file I/O works immediately.
+        if url.startAccessingSecurityScopedResource() {
+            _scopedDirectoryURL = url
+            print("[MC-DL-DIAG] security scope opened for new directory: \(url.lastPathComponent)")
+        }
+    }
+
+    func resetDownloadDirectory() {
+        _scopedDirectoryURL?.stopAccessingSecurityScopedResource()
+        _scopedDirectoryURL = nil
+        UserDefaults.standard.removeObject(forKey: "dm_folder_bookmark")
+    }
+
+    /// Re-opens the security scope after the app returns to foreground.
+    /// iOS revokes scopes when the app is backgrounded — call this from sceneDidBecomeActive / onReceive(.UIApplication.willEnterForegroundNotification).
+    func restoreSecurityScope() {
+        guard let data = UserDefaults.standard.data(forKey: "dm_folder_bookmark") else { return }
+        var stale = false
+        guard let url = try? URL(resolvingBookmarkData: data,
+                                 options: .withoutUI,
+                                 relativeTo: nil,
+                                 bookmarkDataIsStale: &stale), !stale else {
+            if stale {
+                UserDefaults.standard.removeObject(forKey: "dm_folder_bookmark")
+                _scopedDirectoryURL = nil
+            }
+            return
+        }
+        _scopedDirectoryURL?.stopAccessingSecurityScopedResource()
+        if url.startAccessingSecurityScopedResource() {
+            _scopedDirectoryURL = url
+            print("[MC-DL-DIAG] security scope RESTORED: \(url.lastPathComponent)")
+        } else {
+            _scopedDirectoryURL = nil
+            print("[MC-DL-DIAG] security scope restore FAILED: \(url.path)")
+        }
+    }
+
     // MARK: - Init / Persistence
 
     private override init() {
@@ -253,13 +398,75 @@ final class DownloadManager: NSObject, ObservableObject {
         mp4cfg.timeoutIntervalForResource = 3600
         mp4Session = URLSession(configuration: mp4cfg, delegate: self, delegateQueue: nil)
 
-        if let data = UserDefaults.standard.data(forKey: "dm_entries_v1"),
-           let d = try? JSONDecoder().decode([String: DownloadEntry].self, from: data) {
-            entries = d
-            for (k, e) in entries where !FileManager.default.fileExists(atPath: e.localPath) {
-                entries.removeValue(forKey: k)
+        let docsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        print("[MC-DL-DIAG] ===== DownloadManager.init =====")
+        print("[MC-DL-DIAG] CONTAINER_UUID=\(docsURL.path)")
+        print("[MC-DL-DIAG] CONTAINER_RESOLVED=\(docsURL.resolvingSymlinksInPath().path)")
+        let hasBookmark = UserDefaults.standard.data(forKey: "dm_folder_bookmark") != nil
+        print("[MC-DL-DIAG] HAS_BOOKMARK=\(hasBookmark)")
+
+        // Open the security scope for the custom download directory, if one was saved.
+        // Without this, FileManager cannot access files in iCloud Drive / external folders
+        // after an app restart — the scope is never inherited from a previous session.
+        if let data = UserDefaults.standard.data(forKey: "dm_folder_bookmark") {
+            var stale = false
+            if let url = try? URL(resolvingBookmarkData: data,
+                                  options: .withoutUI,
+                                  relativeTo: nil,
+                                  bookmarkDataIsStale: &stale), !stale {
+                if url.startAccessingSecurityScopedResource() {
+                    _scopedDirectoryURL = url
+                    print("[MC-DL-DIAG] security scope OPENED: \(url.path)")
+                } else {
+                    print("[MC-DL-DIAG] security scope start FAILED (sandbox restriction?): \(url.path)")
+                }
+            } else {
+                print("[MC-DL-DIAG] bookmark stale=\(stale) — clearing")
+                if stale { UserDefaults.standard.removeObject(forKey: "dm_folder_bookmark") }
             }
         }
+
+        let rawData = UserDefaults.standard.data(forKey: "dm_entries_v1")
+        print("[MC-DL-DIAG] USERDEFAULTS_KEY=dm_entries_v1 dataSize=\(rawData?.count ?? 0) bytes")
+
+        if let data = rawData,
+           let d = try? JSONDecoder().decode([String: DownloadEntry].self, from: data) {
+            entries = d
+            print("[MC-DL-DIAG] PERSISTED count=\(d.count)")
+            for (key, entry) in d.sorted(by: { $0.key < $1.key }) {
+                let stored   = entry.localPath
+                let resolved = URL(fileURLWithPath: stored).resolvingSymlinksInPath().path
+                let existsStored    = FileManager.default.fileExists(atPath: stored)
+                let existsResolved  = FileManager.default.fileExists(atPath: resolved)
+                let readableStored  = FileManager.default.isReadableFile(atPath: stored)
+                let readableResolved = FileManager.default.isReadableFile(atPath: resolved)
+                let attrs  = try? FileManager.default.attributesOfItem(atPath: resolved)
+                let size   = (attrs?[.size] as? Int64) ?? -1
+                let pathChanged = stored != resolved
+                print("[MC-DL-DIAG] PERSISTED entry ---")
+                print("[MC-DL-DIAG]   key=\(key)")
+                print("[MC-DL-DIAG]   title=\(entry.title)")
+                print("[MC-DL-DIAG]   quality=\(entry.quality) isHLS=\(entry.isHLS)")
+                print("[MC-DL-DIAG]   savedAt=\(entry.savedAt)")
+                print("[MC-DL-DIAG]   localPath=\(stored)")
+                if pathChanged { print("[MC-DL-DIAG]   resolvedPath=\(resolved)  ← SYMLINK DIFFERS") }
+                print("[MC-DL-DIAG]   exists(stored)=\(existsStored) exists(resolved)=\(existsResolved)")
+                print("[MC-DL-DIAG]   readable(stored)=\(readableStored) readable(resolved)=\(readableResolved)")
+                print("[MC-DL-DIAG]   size=\(size) bytes")
+                DownloadManager.logResourceValues(url: URL(fileURLWithPath: resolved), prefix: "  init")
+            }
+        } else if rawData != nil {
+            print("[MC-DL-DIAG] PERSISTED decode FAILED — raw JSON may be corrupt")
+            if let raw = rawData, let str = String(data: raw, encoding: .utf8) {
+                print("[MC-DL-DIAG]   raw (first 300): \(str.prefix(300))")
+            }
+        } else {
+            print("[MC-DL-DIAG] PERSISTED no data in UserDefaults")
+        }
+        print("[MC-DL-DIAG] ===== init done =====")
+        // Don't prune on init — files might be in iCloud/cloud storage and temporarily
+        // unavailable locally. localURL(for:) already returns nil for missing files,
+        // so callers handle the "file not accessible" case gracefully.
     }
 
     private func persist() {
@@ -313,12 +520,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
         guard parts.count == 3 else { return }
         let key = parts[0], title = parts[1], qualityLabel = parts[2]
 
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = DownloadManager.shared.downloadDirectoryURL
         let safe = title
             .components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|"))
             .joined(separator: "_")
         let filename = "\(abs(key.hashValue))_\(safe.prefix(30))_\(qualityLabel).mp4"
-        let dest = docs.appendingPathComponent(filename)
+        let dest = dir.appendingPathComponent(filename)
 
         do {
             if FileManager.default.fileExists(atPath: dest.path) {
@@ -328,7 +535,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
             print(">>> DM: MP4 saved → \(dest.lastPathComponent)")
 
             let entry = DownloadEntry(key: key, title: title, quality: qualityLabel,
-                                      localPath: dest.path, savedAt: Date(), isHLS: false)
+                                      localPath: dest.resolvingSymlinksInPath().path,
+                                      savedAt: Date(), isHLS: false)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.entries[key] = entry

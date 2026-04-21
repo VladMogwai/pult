@@ -33,7 +33,8 @@ struct ContentView: View {
                     httpServer: httpServer,
                     dlna: dlna,
                     selectedDevice: $selectedDevice,
-                    castingTitle: $castingTitle
+                    castingTitle: $castingTitle,
+                    ssdp: ssdp
                 )
                 .tabItem { Label("Files", systemImage: "folder") }
 
@@ -59,6 +60,12 @@ struct ContentView: View {
         }
         .onAppear {
             ssdp.startDiscovery()
+            // Fast-path: directly probe the last-known device so auto-connect
+            // isn't blocked by another device being found first in the general scan.
+            if autoConnect {
+                let lastLoc = UserDefaults.standard.string(forKey: "last_device_location") ?? ""
+                if !lastLoc.isEmpty { ssdp.probeKnownDevice(location: lastLoc) }
+            }
             try? httpServer.start()
             UITabBar.appearance().barTintColor = UIColor(Theme.bgPrimary)
             UITabBar.appearance().backgroundColor = UIColor(Theme.bgPrimary)
@@ -77,12 +84,17 @@ struct ContentView: View {
                 UserDefaults.standard.set(device.friendlyName, forKey: "last_device_name")
             }
         }
-        // Auto-connect: when a previously connected device is discovered, select it
+        // Auto-connect: match by IP address so port/path differences don't break matching
         .onChange(of: ssdp.devices) { _, devices in
             guard autoConnect, selectedDevice == nil else { return }
             let lastLoc = UserDefaults.standard.string(forKey: "last_device_location") ?? ""
+            let lastName = UserDefaults.standard.string(forKey: "last_device_name") ?? ""
             guard !lastLoc.isEmpty else { return }
-            if let match = devices.first(where: { $0.location == lastLoc }) {
+            let lastHost = URL(string: lastLoc)?.host ?? ""
+            // Match by IP first, fall back to friendly name
+            let match = devices.first(where: { URL(string: $0.location)?.host == lastHost })
+                     ?? (!lastName.isEmpty ? devices.first(where: { $0.friendlyName == lastName }) : nil)
+            if let match {
                 selectedDevice = match
             }
         }

@@ -1,5 +1,6 @@
 import AVKit
 import SwiftUI
+import UIKit
 
 // MARK: - ResultRow
 
@@ -53,7 +54,8 @@ struct InfoSheet: View {
     @ObservedObject var dlna: DLNAController
     let selectedDevice: UPnPDevice?
     @Binding var castingTitle: String
-    @Binding var isPresented: Bool
+
+    @Environment(\.dismiss) private var dismiss
 
     @ObservedObject private var dm = DownloadManager.shared
 
@@ -70,14 +72,13 @@ struct InfoSheet: View {
     @State private var lastHeaders: [String: String] = [:]
 
     // Action state
+    @State private var isLoadingSeasons = false
     @State private var isResolving = false
     @State private var resolveError: String?
     @State private var isCasting = false
 
-    // Local player
+    // Local player (presented via UIKit to avoid fullScreenCover-in-sheet crash)
     @State private var playerItem: AVPlayerItem?
-    @State private var showPlayer = false
-    @State private var avPlayer: AVPlayer?
 
     // MARK: Derived
 
@@ -85,9 +86,13 @@ struct InfoSheet: View {
     private var contentLetter: String { String(result.title.prefix(1)).uppercased() }
 
     private var downloadKey: String {
+        episodeKey(season: selectedSeason?.id, episode: selectedEpisode?.id)
+    }
+
+    private func episodeKey(season: String?, episode: String?) -> String {
         var k = result.url
-        if let s = selectedSeason?.id  { k += "__s\(s)" }
-        if let e = selectedEpisode?.id { k += "__e\(e)" }
+        if let s = season  { k += "__s\(s)" }
+        if let e = episode { k += "__e\(e)" }
         return k
     }
 
@@ -99,24 +104,45 @@ struct InfoSheet: View {
                 VStack(spacing: 0) {
                     heroArea
                     contentArea
+                    // Always shown regardless of load state — local data only
+                    downloadedSection
                 }
+            }
+
+            // Persistent close button — always visible regardless of scroll position
+            HStack {
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 28))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(Color.white.opacity(0.9), Color.black.opacity(0.45))
+                        .shadow(color: .black.opacity(0.3), radius: 3, y: 1)
+                }
+                .padding(.top, 14)
+                .padding(.trailing, 16)
             }
         }
         .preferredColorScheme(.dark)
         .task { await loadInfo() }
-        .onChange(of: selectedTranslator) { _, _ in autoResolveIfReady() }
-        .onChange(of: selectedEpisode)    { _, ep in if ep != nil { autoResolveIfReady() } }
-        .fullScreenCover(isPresented: $showPlayer, onDismiss: { avPlayer?.pause() }) {
-            if let player = avPlayer {
-                VideoPlayerView(player: player, isPresented: $showPlayer)
+        .onChange(of: selectedTranslator) { _, newTranslator in
+            guard let info else { return }
+            if info.type == "series" {
+                Task { await reloadSeasons(translatorId: newTranslator?.id) }
+            } else {
+                autoResolveIfReady()
             }
         }
+        .onChange(of: selectedEpisode)    { _, ep in if ep != nil { autoResolveIfReady() } }
     }
 
     private func autoResolveIfReady() {
         guard let info, !isResolving else { return }
         let isSeries = info.type == "series"
         guard !isSeries || selectedEpisode != nil else { return }
+        // Already downloaded or currently downloading — don't interfere
+        if dm.isDownloaded(key: downloadKey) { return }
+        if dm.isDownloading(key: downloadKey) { return }
         qualities = []
         selectedQuality = nil
         lastHeaders = [:]
@@ -143,7 +169,7 @@ struct InfoSheet: View {
 
             VStack {
                 HStack {
-                    Button { isPresented = false } label: {
+                    Button { dismiss() } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 13, weight: .semibold))
@@ -263,7 +289,15 @@ struct InfoSheet: View {
             }
 
             // Season + episode chips (series only)
-            if info.type == "series", let seasons = info.seasons, !seasons.isEmpty {
+            if isLoadingSeasons {
+                HStack(spacing: 8) {
+                    ProgressView().tint(Theme.accent).scaleEffect(0.8)
+                    Text("Загрузка серий…")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textMuted)
+                }
+                .padding(.vertical, 4)
+            } else if info.type == "series", let seasons = info.seasons, !seasons.isEmpty {
                 VStack(alignment: .leading, spacing: 7) {
                     sectionLabel("Сезон")
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -301,7 +335,11 @@ struct InfoSheet: View {
                                         selectedEpisode = ep
                                     }
                                 } label: {
-                                    ChipView(label: ep.id, isActive: ep.id == selectedEpisode?.id)
+                                    ChipView(
+                                        label: ep.id,
+                                        isActive: ep.id == selectedEpisode?.id,
+                                        isDownloaded: dm.isDownloaded(key: episodeKey(season: selectedSeason?.id, episode: ep.id))
+                                    )
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -337,7 +375,7 @@ struct InfoSheet: View {
         }
         .padding(.horizontal, 15)
         .padding(.top, 14)
-        .padding(.bottom, 20)
+        .padding(.bottom, 8)
     }
 
     private func sectionLabel(_ text: String) -> some View {
@@ -384,14 +422,19 @@ struct InfoSheet: View {
                 }
                 .disabled(isCasting)
 
-                // Watch on phone (local file)
+                // Watch on phone (local file) — UIKit direct present avoids sheet-in-sheet crash
                 Button {
-                    if let localURL = dm.localURL(for: key) {
-                        let player = AVPlayer(url: localURL)
-                        avPlayer = player
-                        showPlayer = true
-                        player.play()
-                    }
+                    guard let localURL = dm.localURL(for: key) else { return }
+                    let player = AVPlayer(url: localURL)
+                    let vc = AVPlayerViewController()
+                    vc.player = player
+                    vc.showsPlaybackControls = true
+                    player.play()
+                    guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                          let root = scene.windows.first?.rootViewController else { return }
+                    var top = root
+                    while let p = top.presentedViewController { top = p }
+                    top.present(vc, animated: true)
                 } label: {
                     HStack(spacing: 9) {
                         Image(systemName: "iphone")
@@ -566,36 +609,40 @@ struct InfoSheet: View {
                 }
                 .disabled(selectedQuality == nil)
 
-                // Watch on phone via proxy stream
-                Button {
-                    Task { await watchOnPhone() }
-                } label: {
-                    HStack(spacing: 9) {
-                        Image(systemName: "iphone")
-                            .font(.system(size: 15))
-                            .foregroundColor(Theme.textSecondary)
-                        Text("Смотреть на телефоне")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(Theme.textPrimary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 13)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .fill(Theme.bgTertiary)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 14)
-                                    .strokeBorder(Theme.borderMid, lineWidth: 0.5)
-                            )
-                    )
-                }
-                .disabled(selectedQuality == nil)
             }
         }
         .padding(.top, 6)
     }
 
     // MARK: - Networking
+
+    private func reloadSeasons(translatorId: String?) async {
+        isLoadingSeasons = true
+        qualities = []
+        selectedQuality = nil
+        lastHeaders = [:]
+        resolveError = nil
+        do {
+            let seasons = try await RezkaDirectClient.shared.getEpisodes(
+                url: result.url,
+                translatorId: translatorId
+            )
+            if let current = info {
+                info = InfoResponse(
+                    type: current.type,
+                    title: current.title,
+                    poster: current.poster,
+                    translators: current.translators,
+                    seasons: seasons
+                )
+            }
+            selectedSeason = seasons.last
+            selectedEpisode = nil
+        } catch {
+            // keep existing data on failure
+        }
+        isLoadingSeasons = false
+    }
 
     private func loadInfo() async {
         isLoading = true
@@ -604,7 +651,7 @@ struct InfoSheet: View {
             let resp = try await APIClient.shared.info(url: result.url)
             info = resp
             selectedTranslator = resp.translators?.first
-            selectedSeason = resp.seasons?.first
+            selectedSeason = resp.seasons?.last
             selectedEpisode = nil
             HistoryStore.shared.record(
                 key: result.url,
@@ -612,10 +659,12 @@ struct InfoSheet: View {
                 poster: resp.poster ?? result.poster,
                 isLocal: false
             )
-            // Auto-resolve for movies immediately
+            // Auto-resolve for movies immediately (skip if already downloaded)
             if resp.type != "series" {
                 isLoading = false
-                await resolveQualities(info: resp)
+                if !dm.isDownloaded(key: result.url) {
+                    await resolveQualities(info: resp)
+                }
                 return
             }
         } catch {
@@ -628,7 +677,6 @@ struct InfoSheet: View {
         isResolving = true
         if attempt == 0 { resolveError = nil }
         do {
-            // Resolve directly from Rezka CDN — no backend involved
             let resp = try await RezkaDirectClient.shared.resolve(
                 url: result.url,
                 season: selectedSeason?.id,
@@ -670,31 +718,11 @@ struct InfoSheet: View {
             try await dlna.setAVTransportURI(videoURL: serveURL)
             try await dlna.play()
             castingTitle = buildTitle(info: info)
-            isPresented = false
+            dismiss()
         } catch {
             resolveError = error.localizedDescription
         }
         isCasting = false
-    }
-
-    private func watchOnPhone() async {
-        guard let quality = selectedQuality,
-              let streamURL = URL(string: quality.streamUrl) else { return }
-
-        // Use proxy if there are custom headers, otherwise direct
-        let playURL: URL
-        if lastHeaders.isEmpty {
-            playURL = streamURL
-        } else if let proxyURL = httpServer.addProxy(targetURL: streamURL, headers: lastHeaders) {
-            playURL = proxyURL
-        } else {
-            playURL = streamURL
-        }
-
-        let player = AVPlayer(url: playURL)
-        avPlayer = player
-        showPlayer = true
-        player.play()
     }
 
     private func buildTitle(info: InfoResponse) -> String {
@@ -703,6 +731,164 @@ struct InfoSheet: View {
             t += " – \(s.name), \(e.name)"
         }
         return t
+    }
+
+    // MARK: - Downloaded section (always rendered, independent of network load)
+
+    @ViewBuilder
+    private var downloadedSection: some View {
+        let downloaded = downloadedEntries
+        if !downloaded.isEmpty {
+            VStack(alignment: .leading, spacing: 7) {
+                Divider().background(Theme.borderSubtle)
+                sectionLabel("Скачано")
+                VStack(spacing: 0) {
+                    ForEach(downloaded, id: \.key) { item in
+                        downloadedRow(key: item.key, entry: item.entry)
+                        if item.key != downloaded.last?.key {
+                            Divider().background(Theme.borderSubtle).padding(.leading, 12)
+                        }
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Theme.bgSecondary)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(Theme.borderSubtle, lineWidth: 0.5)
+                        )
+                )
+            }
+            .padding(.horizontal, 15)
+            .padding(.top, 10)
+            .padding(.bottom, 20)
+        }
+    }
+
+    // MARK: - Downloaded entries for this asset
+
+    private var downloadedEntries: [(key: String, entry: DownloadEntry)] {
+        let base = result.url
+        return dm.entries
+            .filter { $0.key == base || $0.key.hasPrefix(base + "__") }
+            .map { (key: $0.key, entry: $0.value) }
+            .sorted { $0.entry.savedAt < $1.entry.savedAt }
+    }
+
+    @ViewBuilder
+    private func downloadedRow(key: String, entry: DownloadEntry) -> some View {
+        let prefix = result.title + " – "
+        let subtitle = entry.title.hasPrefix(prefix)
+            ? String(entry.title.dropFirst(prefix.count))
+            : entry.title
+        let fileURL = URL(fileURLWithPath: entry.localPath)
+        let fileExists = (try? fileURL.checkResourceIsReachable()) == true
+        // [MC-DL-DIAG] Compare UI's own check (raw path) vs DownloadManager.localURL (resolved path)
+        let _diagDump: Void = {
+            let rawExists   = FileManager.default.fileExists(atPath: entry.localPath)
+            let rawReadable = FileManager.default.isReadableFile(atPath: entry.localPath)
+            let resolvedURL = URL(fileURLWithPath: entry.localPath).resolvingSymlinksInPath()
+            let resolvedExists   = FileManager.default.fileExists(atPath: resolvedURL.path)
+            let resolvedReadable = FileManager.default.isReadableFile(atPath: resolvedURL.path)
+            let resolvedReachable = (try? resolvedURL.checkResourceIsReachable()) == true
+            let dmResult = dm.localURL(for: key) != nil
+            print("[MC-DL-DIAG] downloadedRow key=\(key.suffix(50))")
+            print("[MC-DL-DIAG]   entry.localPath=\(entry.localPath)")
+            print("[MC-DL-DIAG]   raw: reachable=\(fileExists) exists=\(rawExists) readable=\(rawReadable)")
+            print("[MC-DL-DIAG]   resolved: reachable=\(resolvedReachable) exists=\(resolvedExists) readable=\(resolvedReadable)")
+            print("[MC-DL-DIAG]   dm.localURL(key)=\(dmResult)  ← canonical check")
+            if fileExists != dmResult {
+                print("[MC-DL-DIAG]   *** MISMATCH: UI raw=\(fileExists) vs dm.localURL=\(dmResult) ***")
+            }
+            DownloadManager.logResourceValues(url: resolvedURL, prefix: "  downloadedRow")
+        }()
+        let _ = _diagDump
+        let sizeBytes = fileExists
+            ? ((try? FileManager.default.attributesOfItem(atPath: entry.localPath))?[.size] as? Int64)
+            : nil
+        let sizeMB = sizeBytes.map { String(format: "%.0f MB", Double($0) / 1_048_576) }
+
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(subtitle)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(fileExists ? Theme.textPrimary : Theme.textMuted)
+                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(entry.quality)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Theme.accent)
+                        .padding(.vertical, 2).padding(.horizontal, 6)
+                        .background(RoundedRectangle(cornerRadius: 4).fill(Theme.accentBg))
+                    if let size = sizeMB {
+                        Text(size)
+                            .font(.system(size: 10))
+                            .foregroundColor(Theme.textMuted)
+                    } else if !fileExists {
+                        Text("файл недоступен")
+                            .font(.system(size: 10))
+                            .foregroundColor(Theme.danger.opacity(0.8))
+                    }
+                }
+            }
+            Spacer()
+            if fileExists {
+                // Cast to TV
+                Button { Task { await castEntry(entry) } } label: {
+                    Image(systemName: "tv.fill")
+                        .font(.system(size: 14))
+                        .foregroundColor(Theme.castActive)
+                        .frame(width: 34, height: 34)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.castActiveBg))
+                }
+                // Save to Google Drive / iCloud / Files — uses iOS share sheet
+                ShareLink(item: URL(fileURLWithPath: entry.localPath)) {
+                    Image(systemName: "arrow.up.to.line")
+                        .font(.system(size: 14))
+                        .foregroundColor(Theme.textSecondary)
+                        .frame(width: 34, height: 34)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.bgTertiary))
+                }
+            }
+            // Delete
+            Button { dm.remove(key: key) } label: {
+                Image(systemName: "trash")
+                    .font(.system(size: 13))
+                    .foregroundColor(Theme.danger)
+                    .frame(width: 34, height: 34)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.bgTertiary))
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .buttonStyle(.plain)
+    }
+
+    private func castEntry(_ entry: DownloadEntry) async {
+        let localURL = URL(fileURLWithPath: entry.localPath)
+        guard FileManager.default.fileExists(atPath: entry.localPath) else {
+            resolveError = "Файл не найден на устройстве."
+            return
+        }
+        guard selectedDevice != nil else {
+            resolveError = "Устройство не выбрано. Перейдите в Настройки."
+            return
+        }
+        guard let serveURL = httpServer.addVideo(at: localURL) else {
+            resolveError = "Не удалось запустить локальный сервер (нет Wi-Fi?)."
+            return
+        }
+        isCasting = true
+        resolveError = nil
+        do {
+            try await dlna.setAVTransportURI(videoURL: serveURL)
+            try await dlna.play()
+            castingTitle = entry.title
+            dismiss()
+        } catch {
+            resolveError = error.localizedDescription
+        }
+        isCasting = false
     }
 }
 

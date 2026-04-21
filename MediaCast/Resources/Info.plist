@@ -40,5 +40,11 @@
     <key>UIRequiresFullScreen</key>
     <false/>
 
+    <!-- Expose Documents folder in Files.app -->
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+
 </dict>
 </plist>

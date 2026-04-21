@@ -7,6 +7,7 @@ struct FilePickerView: View {
     @ObservedObject var dlna: DLNAController
     @Binding var selectedDevice: UPnPDevice?
     @Binding var castingTitle: String
+    @ObservedObject var ssdp: SSDPDiscovery
 
     @State private var showPicker = false
     @State private var isCasting = false
@@ -104,14 +105,7 @@ struct FilePickerView: View {
                     }
                     .disabled(isCasting)
                 } else {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle")
-                            .font(.system(size: 12))
-                            .foregroundColor(Theme.textMuted)
-                        Text("Устройство не выбрано — перейдите в Настройки")
-                            .font(.system(size: 11))
-                            .foregroundColor(Theme.textMuted)
-                    }
+                    devicePicker
                 }
 
                 if let err = castError {
@@ -165,6 +159,70 @@ struct FilePickerView: View {
         }
     }
 
+    // MARK: - Device picker (shown when no device selected)
+
+    private var devicePicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Выберите устройство")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Theme.textMuted)
+                Spacer()
+                if ssdp.isScanning {
+                    ProgressView().scaleEffect(0.7).tint(Theme.accent)
+                } else {
+                    Button {
+                        ssdp.clearAndRediscover()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.accent)
+                    }
+                }
+            }
+
+            if ssdp.devices.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "tv.slash")
+                        .font(.system(size: 14))
+                        .foregroundColor(Theme.textMuted)
+                    Text(ssdp.isScanning ? "Поиск устройств…" : "Устройства не найдены")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textMuted)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 6)
+            } else {
+                ForEach(ssdp.devices) { device in
+                    Button {
+                        selectedDevice = device
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "tv.fill")
+                                .font(.system(size: 14))
+                                .foregroundColor(Theme.textMuted)
+                            Text(device.friendlyName)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundColor(Theme.textPrimary)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 11))
+                                .foregroundColor(Theme.textMuted)
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Theme.bgTertiary)
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Theme.borderMid, lineWidth: 0.5))
+        )
+    }
+
     // MARK: - Cast
 
     private func castToTV(video: URL) async {
@@ -200,6 +258,41 @@ struct FilePickerView: View {
             return nil
         }
         return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+}
+
+// MARK: - Folder picker
+
+struct FolderPickerView: UIViewControllerRepresentable {
+    let onPick: (URL) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        return picker
+    }
+
+    func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let parent: FolderPickerView
+        init(parent: FolderPickerView) { self.parent = parent }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard let url = urls.first else { return }
+            DispatchQueue.main.async {
+                self.parent.onPick(url)
+                self.parent.dismiss()
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            parent.dismiss()
+        }
     }
 }
 

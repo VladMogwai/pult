@@ -24,6 +24,10 @@ final class RezkaDirectClient {
             translatorId: translatorId
         )
     }
+
+    func getEpisodes(url: String, translatorId: String?) async throws -> [RezkaSeason] {
+        try await RezkaWebScraper.shared.getEpisodes(pageURL: url, translatorId: translatorId)
+    }
 }
 
 // MARK: - Errors

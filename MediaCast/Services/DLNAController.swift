@@ -34,6 +34,8 @@ final class DLNAController: ObservableObject {
 
     func setAVTransportURI(videoURL: URL) async throws {
         pausePolling()
+        print("[MC-DIAG] DLNAController.setAVTransportURI url=\(videoURL.absoluteString)")
+        print("[MC-DIAG]   host=\(videoURL.host ?? "?") scheme=\(videoURL.scheme ?? "?") path=\(videoURL.path.prefix(80))")
         // Strip any query params so currentVideoURL is always a clean base URL.
         var comps = URLComponents(url: videoURL, resolvingAgainstBaseURL: false)
         comps?.queryItems = nil
@@ -95,12 +97,51 @@ final class DLNAController: ObservableObject {
                 print(">>> resume: Seek failed (\(error)) — playing from start")
             }
             resumePolling()
+            startDiagnosticPolling()
         } else {
             // Resume from real UPnP Pause, or start from stopped state.
             isPaused = false
-            try await sendPlay()
+            do {
+                try await sendPlay()
+            } catch let error as DLNAError {
+                // Samsung returns 701 "Transition not available" when the TV is still
+                // loading the URI set by SetAVTransportURI — it will auto-start playing.
+                // Treat this as success so we don't surface a spurious error to the user.
+                guard case .soapFault(_, let xml) = error,
+                      xml.contains("<errorCode>701</errorCode>") else { throw error }
+                print(">>> play: 701 TRANSITIONING — TV is already loading, treating as success")
+            }
             transportState = .playing
             resumePolling()
+            startDiagnosticPolling()
+        }
+    }
+
+    /// Polls GetTransportInfo + GetPositionInfo 10 times at 1-second intervals after play().
+    /// Runs in a fire-and-forget Task — does not interfere with regular polling.
+    private func startDiagnosticPolling() {
+        Task { [weak self] in
+            guard let self else { return }
+            print("[MC-DIAG] DLNAController diagnostic poll: start (10 × 1s)")
+            for step in 1...10 {
+                try? await Task.sleep(for: .seconds(1))
+                if let controlURL = try? self.avTransportURL() {
+                    let transportXML = (try? await self.soapResponse(url: controlURL, service: "AVTransport",
+                                                                     action: "GetTransportInfo",
+                                                                     body: "<InstanceID>0</InstanceID>")) ?? "error"
+                    let state = self.extractXML(transportXML, tag: "CurrentTransportState") ?? "UNKNOWN"
+                    let posXML = (try? await self.soapResponse(url: controlURL, service: "AVTransport",
+                                                               action: "GetPositionInfo",
+                                                               body: "<InstanceID>0</InstanceID>")) ?? "error"
+                    let pos = self.extractXML(posXML, tag: "RelTime") ?? "?"
+                    let dur = self.extractXML(posXML, tag: "TrackDuration") ?? "?"
+                    print("[MC-DIAG] DLNAController poll[\(step)/10] state=\(state) pos=\(pos) dur=\(dur)")
+                } else {
+                    print("[MC-DIAG] DLNAController poll[\(step)/10] no device")
+                    break
+                }
+            }
+            print("[MC-DIAG] DLNAController diagnostic poll: done")
         }
     }
 

@@ -46,6 +46,17 @@ final class SSDPDiscovery: ObservableObject {
         devices.append(device)
     }
 
+    /// Directly probes a previously-known device location so auto-connect works
+    /// even when the general scan misses it (e.g. another device is found first).
+    func probeKnownDevice(location: String) {
+        guard let ip = URL(string: location)?.host else { return }
+        Task { [weak self] in
+            if let device = await Self.probeHost(ip: ip) {
+                await MainActor.run { self?.addDevice(device) }
+            }
+        }
+    }
+
     // MARK: - Subnet scan
 
     private func startSubnetScan() {

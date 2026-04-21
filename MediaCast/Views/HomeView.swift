@@ -13,7 +13,6 @@ struct HomeView: View {
     @State private var isSearching = false
     @State private var searchError: String?
     @State private var selectedResult: SearchResult?
-    @State private var showInfo = false
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -42,18 +41,14 @@ struct HomeView: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
         }
-        .sheet(isPresented: $showInfo) {
-            if let result = selectedResult {
-                InfoSheet(
-                    result: result,
-                    httpServer: httpServer,
-                    dlna: dlna,
-                    selectedDevice: selectedDevice,
-                    castingTitle: $castingTitle,
-                    isPresented: $showInfo
-                )
-                .id(result.url)
-            }
+        .sheet(item: $selectedResult) { result in
+            InfoSheet(
+                result: result,
+                httpServer: httpServer,
+                dlna: dlna,
+                selectedDevice: selectedDevice,
+                castingTitle: $castingTitle
+            )
         }
     }
 
@@ -163,7 +158,6 @@ struct HomeView: View {
             guard !entry.isLocal else { return }
             selectedResult = SearchResult(url: entry.key, title: entry.title,
                                           poster: entry.poster, info: nil)
-            showInfo = true
         } label: {
             HStack(spacing: 12) {
                 // Poster / icon
@@ -235,7 +229,7 @@ struct HomeView: View {
                     .listRowBackground(Theme.bgPrimary)
                     .listRowSeparatorTint(Theme.borderSubtle)
                     .contentShape(Rectangle())
-                    .onTapGesture { selectedResult = result; showInfo = true }
+                    .onTapGesture { selectedResult = result }
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)

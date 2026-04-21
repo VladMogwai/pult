@@ -66,6 +66,9 @@ final class HTTPServer: ObservableObject {
         let proxyId = UUID().uuidString
         let item = ProxyItem(targetURL: targetURL, headers: headers)
         proxyLock.withLock { proxyItems[proxyId] = item }
+        print("[MC-DIAG] HTTPServer.addProxy id=\(proxyId)")
+        print("[MC-DIAG]   target=\(targetURL.absoluteString.prefix(120))")
+        print("[MC-DIAG]   headers=\(headers)")
         return URL(string: "http://\(localIP):\(port)/proxy/\(proxyId)")
     }
 
@@ -116,14 +119,19 @@ final class HTTPServer: ObservableObject {
             guard let self else { return .notFound }
             let proxyId = request.params[":proxyId"] ?? ""
             guard let item = proxyLock.withLock({ self.proxyItems[proxyId] }) else {
+                print("[MC-DIAG] HTTPServer proxy unknown id=\(proxyId)")
                 return .notFound
             }
+
+            print("[MC-DIAG] HTTPServer proxy incoming: id=\(proxyId.prefix(8)) range=\(request.headers["range"] ?? "none") ua=\(request.headers["user-agent"]?.prefix(60) ?? "none")")
 
             var cdnReq = URLRequest(url: item.targetURL, timeoutInterval: 30)
             for (k, v) in item.headers { cdnReq.setValue(v, forHTTPHeaderField: k) }
             if let range = request.headers["range"] {
                 cdnReq.setValue(range, forHTTPHeaderField: "Range")
             }
+
+            print("[MC-DIAG] HTTPServer proxy CDN request: \(item.targetURL.absoluteString.prefix(120))")
 
             // SEEK FIX: Delegate-based session surfaces errors as non-200 status codes
             // instead of silently returning 200 OK with an empty body.
@@ -134,12 +142,18 @@ final class HTTPServer: ObservableObject {
             // SEEK FIX: Return 504 if CDN doesn't respond in time rather than hanging forever.
             guard collector.awaitHeaders(timeout: 15) else {
                 session.invalidateAndCancel()
+                print("[MC-DIAG] HTTPServer proxy CDN timeout (15s) id=\(proxyId.prefix(8))")
                 return .raw(504, "Gateway Timeout", [:]) { _ in }
             }
 
             let cdnStatus  = collector.statusCode
             // SEEK FIX: All header keys are lowercased so HTTP/2 headers are found correctly.
             let cdnHeaders = collector.normalizedHeaders
+
+            print("[MC-DIAG] HTTPServer proxy CDN response: status=\(cdnStatus) content-type=\(cdnHeaders["content-type"] ?? "?") content-length=\(cdnHeaders["content-length"] ?? "?") content-range=\(cdnHeaders["content-range"] ?? "none")")
+            if cdnStatus >= 400 {
+                print("[MC-DIAG] HTTPServer proxy CDN ERROR status=\(cdnStatus) url=\(item.targetURL.absoluteString.prefix(120))")
+            }
 
             var outHeaders = Self.dlnaHeaders
             outHeaders["Content-Type"]  = cdnHeaders["content-type"] ?? "video/mp4"
