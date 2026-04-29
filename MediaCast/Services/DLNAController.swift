@@ -19,10 +19,13 @@ final class DLNAController: ObservableObject {
 
     private(set) var selectedDevice: UPnPDevice?
     private var pollingTask: Task<Void, Never>?
+    private var diagnosticTask: Task<Void, Never>?
     /// Retained so seek / resume can replay the full SetURI → Play → Seek sequence.
     private(set) var currentVideoURL: URL?
     /// Position captured on fake pause; cleared on resume or stop.
     private var pausedPosition: TimeInterval?
+    /// Prevents parallel seek operations from conflicting on the TV.
+    private var seekInProgress = false
 
     // MARK: - Device selection
 
@@ -118,13 +121,15 @@ final class DLNAController: ObservableObject {
     }
 
     /// Polls GetTransportInfo + GetPositionInfo 10 times at 1-second intervals after play().
-    /// Runs in a fire-and-forget Task — does not interfere with regular polling.
+    /// Stored in diagnosticTask so pausePolling() can cancel it before any control action.
     private func startDiagnosticPolling() {
-        Task { [weak self] in
+        diagnosticTask?.cancel()
+        diagnosticTask = Task { [weak self] in
             guard let self else { return }
             print("[MC-DIAG] DLNAController diagnostic poll: start (10 × 1s)")
             for step in 1...10 {
                 try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { break }
                 if let controlURL = try? self.avTransportURL() {
                     let transportXML = (try? await self.soapResponse(url: controlURL, service: "AVTransport",
                                                                      action: "GetTransportInfo",
@@ -188,6 +193,13 @@ final class DLNAController: ObservableObject {
     }
 
     func seek(to position: TimeInterval) async throws {
+        guard !seekInProgress else {
+            print(">>> seek: ignored — seek already in progress")
+            return
+        }
+        seekInProgress = true
+        defer { seekInProgress = false }
+
         print(">>> seek() called with position=\(position) transportState=\(transportState)")
         pausePolling()
         defer { resumePolling() }
@@ -196,11 +208,6 @@ final class DLNAController: ObservableObject {
         isPaused = false
 
         if transportState == .playing || transportState == .paused {
-            // Video is already loaded on the TV — send Seek REL_TIME directly.
-            // Restarting with Stop+SetURI+Play causes Samsung to ignore the subsequent
-            // Seek because the stream hasn't buffered yet at that point.
-            //
-            // Samsung returns 500 on Seek while in PAUSED_PLAYBACK — must resume first.
             if transportState == .paused {
                 print(">>> seek: resuming from pause before seek")
                 pausedPosition = nil
@@ -209,20 +216,29 @@ final class DLNAController: ObservableObject {
                 transportState = .playing
                 try await waitUntilPlaying()
             }
-            print(">>> seek: direct Seek REL_TIME to \(formatTime(position))")
-            do {
-                try await sendSeekSOAP(to: position)
-            } catch let error as DLNAError {
-                // 701 means the renderer is still in TRANSITIONING (e.g. re-buffering
-                // after a recent seek). Wait until it reaches PLAYING, then retry once.
-                guard case .soapFault(_, let xml) = error,
-                      xml.contains("<errorCode>701</errorCode>") else { throw error }
-                print(">>> seek: 701 TRANSITIONING — waiting then retrying")
-                try await waitUntilPlaying(timeout: 5.0)
-                try await sendSeekSOAP(to: position)
+
+            // For local /video/ files skip UPnP Seek entirely — this TV never accepts it
+            // for HTTP streams. Go straight to HTTP seek via ?t=<seconds>.
+            // For /proxy/ CDN streams try UPnP first (may work on some renderers).
+            let base = currentVideoURL
+            let isLocalFile = base?.path.contains("/video/") == true
+
+            if isLocalFile {
+                print(">>> seek: local file — skipping UPnP, using HTTP seek at \(Int(position))s")
+                try await httpSeek(to: position, base: base)
+            } else {
+                print(">>> seek: direct Seek REL_TIME to \(formatTime(position))")
+                do {
+                    try await seekWithRetry(to: position)
+                    currentPosition = position
+                    print(">>> seek: complete at \(formatTime(position))")
+                } catch let err as DLNAError {
+                    guard case .soapFault(_, let xml) = err,
+                          xml.contains("<errorCode>701</errorCode>") else { throw err }
+                    print(">>> seek: UPnP Seek failed — HTTP seek fallback at \(Int(position))s")
+                    try await httpSeek(to: position, base: base)
+                }
             }
-            currentPosition = position
-            print(">>> seek: complete at \(formatTime(position))")
         } else {
             // Video not loaded — full Stop → SetURI → Play → wait → Seek cycle.
             guard let baseURL = currentVideoURL else {
@@ -291,6 +307,46 @@ final class DLNAController: ObservableObject {
                        action: "Play", body: "<InstanceID>0</InstanceID><Speed>1</Speed>")
     }
 
+    /// HTTP seek: Stop → SetAVTransportURI(?t=seconds) → Play.
+    /// For /video/ local files the server builds an MP4 from the nearest keyframe.
+    /// For /proxy/ CDN streams (no ?t= support) we restart from the beginning.
+    private func httpSeek(to position: TimeInterval, base: URL?) async throws {
+        guard let base else { return }
+        var comps = URLComponents(url: base, resolvingAgainstBaseURL: false) ?? URLComponents()
+        if base.path.contains("/video/") {
+            comps.queryItems = [URLQueryItem(name: "t", value: String(Int(position)))]
+        } else {
+            comps.queryItems = nil
+        }
+        let seekURL = comps.url ?? base
+        let ctrl = try avTransportURL()
+        try await soap(url: ctrl, service: "AVTransport", action: "Stop",
+                       body: "<InstanceID>0</InstanceID>")
+        try await setAVTransportURI(videoURL: seekURL)
+        try await sendPlay()
+        transportState = .playing
+        if base.path.contains("/video/") { currentPosition = position }
+        print(">>> seek: HTTP seek done → \(seekURL.absoluteString.prefix(80))")
+    }
+
+    /// Retries Seek up to `maxAttempts` times, waiting between each on 701.
+    /// TV may report PLAYING state but still reject Seek for several hundred ms
+    /// after transitioning — a single retry is not enough for some renderers.
+    private func seekWithRetry(to position: TimeInterval, maxAttempts: Int = 4) async throws {
+        for attempt in 1...maxAttempts {
+            do {
+                try await sendSeekSOAP(to: position)
+                return
+            } catch let error as DLNAError {
+                guard case .soapFault(_, let xml) = error,
+                      xml.contains("<errorCode>701</errorCode>"),
+                      attempt < maxAttempts else { throw error }
+                print(">>> seekWithRetry: 701 on attempt \(attempt)/\(maxAttempts) — waiting 700ms")
+                try await Task.sleep(for: .milliseconds(700))
+            }
+        }
+    }
+
     /// Sends Seek REL_TIME SOAP action to the TV.
     private func sendSeekSOAP(to position: TimeInterval) async throws {
         let controlURL = try avTransportURL()
@@ -352,6 +408,8 @@ final class DLNAController: ObservableObject {
     func pausePolling() {
         pollingTask?.cancel()
         pollingTask = nil
+        diagnosticTask?.cancel()
+        diagnosticTask = nil
     }
 
     /// Restarts the polling loop after a control action completes.

@@ -189,58 +189,69 @@ struct CastControlSheet: View {
     // MARK: Transport controls
 
     private var transportControls: some View {
-        HStack(spacing: 44) {
+        VStack(spacing: 16) {
+            // ←30s  ←10s  ▶/⏸  +10s  +30s
+            HStack(spacing: 28) {
+                skipButton("gobackward.30") { max(0, dlna.currentPosition - 30) }
+                skipButton("gobackward.10") { max(0, dlna.currentPosition - 10) }
+
+                Button {
+                    Task {
+                        if isPlaying { try? await dlna.pause() }
+                        else         { try? await dlna.play()  }
+                    }
+                } label: {
+                    ZStack {
+                        Circle().fill(Theme.accent).frame(width: 56, height: 56)
+                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                            .font(.system(size: 22))
+                            .foregroundStyle(.white)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                skipButton("goforward.10") {
+                    dlna.duration > 0 ? min(dlna.currentPosition + 10, dlna.duration) : dlna.currentPosition + 10
+                }
+                skipButton("goforward.30") {
+                    dlna.duration > 0 ? min(dlna.currentPosition + 30, dlna.duration) : dlna.currentPosition + 30
+                }
+            }
+
             // Stop
-            Button {
-                Task { try? await dlna.stop() }
-            } label: {
+            Button { Task { try? await dlna.stop() } } label: {
                 Image(systemName: "stop.fill")
-                    .font(.system(size: 22))
+                    .font(.system(size: 16))
                     .foregroundStyle(Theme.textMuted)
             }
             .buttonStyle(.plain)
+        }
+    }
 
-            // Rewind 10s
-            Button {
-                let t = max(0, dlna.currentPosition - 10)
-                Task { try? await dlna.seek(to: t) }
-            } label: {
-                Image(systemName: "gobackward.10")
-                    .font(.system(size: 22))
-                    .foregroundStyle(Theme.textMuted)
+    private func skipButton(_ icon: String, target: @escaping () -> TimeInterval) -> some View {
+        Button {
+            let t = target()
+            print(">>> SKIP \(icon) → \(t)s")
+            Task {
+                do { try await dlna.seek(to: t) }
+                catch { print(">>> SKIP ERROR: \(error)") }
             }
-            .buttonStyle(.plain)
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 22))
+                .foregroundStyle(Theme.textMuted)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(ScaleButtonStyle())
+    }
 
-            // Play / Pause
-            Button {
-                Task {
-                    if isPlaying { try? await dlna.pause() }
-                    else         { try? await dlna.play()  }
-                }
-            } label: {
-                ZStack {
-                    Circle().fill(Theme.accent).frame(width: 48, height: 48)
-                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 20))
-                        .foregroundStyle(.white)
-                }
-            }
-            .buttonStyle(.plain)
-
-            // Forward 30s
-            Button {
-                let t = dlna.duration > 0
-                    ? min(dlna.currentPosition + 30, dlna.duration)
-                    : dlna.currentPosition + 30
-                Task { try? await dlna.seek(to: t) }
-            } label: {
-                Image(systemName: "goforward.30")
-                    .font(.system(size: 22))
-                    .foregroundStyle(Theme.textMuted)
-            }
-            .buttonStyle(.plain)
-
-            Color.clear.frame(width: 22, height: 22)
+    private struct ScaleButtonStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .scaleEffect(configuration.isPressed ? 0.78 : 1.0)
+                .opacity(configuration.isPressed ? 0.55 : 1.0)
+                .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
         }
     }
 

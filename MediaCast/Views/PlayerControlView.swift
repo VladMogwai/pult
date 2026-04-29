@@ -168,74 +168,85 @@ struct PlayerControlView: View {
     // MARK: - Transport controls
 
     private var transportControls: some View {
-        HStack(spacing: 44) {
-            // Stop
-            IconButton(name: "stop.fill", size: 22, tint: Theme.textMuted) {
+        VStack(spacing: 16) {
+            // ←30s  ←10s  ▶/⏸  +10s  +30s
+            HStack(spacing: 28) {
+                IconButton(name: "gobackward.30", size: 22, tint: Theme.textMuted) {
+                    let t = max(0, dlna.currentPosition - 30)
+                    print(">>> SKIP -30s → \(t)s")
+                    Task {
+                        do { try await dlna.seek(to: t) }
+                        catch { errorMessage = error.localizedDescription }
+                    }
+                }
+
+                IconButton(name: "gobackward.10", size: 22, tint: Theme.textMuted) {
+                    let t = max(0, dlna.currentPosition - 10)
+                    print(">>> SKIP -10s → \(t)s")
+                    Task {
+                        do { try await dlna.seek(to: t) }
+                        catch { errorMessage = error.localizedDescription }
+                    }
+                }
+
+                // Play / Pause
+                if isCasting {
+                    ProgressView()
+                        .tint(Theme.accent)
+                        .frame(width: 56, height: 56)
+                } else {
+                    Button {
+                        Task {
+                            do {
+                                if isPlaying { try await dlna.pause() }
+                                else         { try await dlna.play()  }
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                        }
+                    } label: {
+                        ZStack {
+                            Circle()
+                                .fill(Theme.accent)
+                                .frame(width: 56, height: 56)
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 22))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                IconButton(name: "goforward.10", size: 22, tint: Theme.textMuted) {
+                    let t = dlna.duration > 0
+                        ? min(dlna.currentPosition + 10, dlna.duration)
+                        : dlna.currentPosition + 10
+                    print(">>> SKIP +10s → \(t)s")
+                    Task {
+                        do { try await dlna.seek(to: t) }
+                        catch { errorMessage = error.localizedDescription }
+                    }
+                }
+
+                IconButton(name: "goforward.30", size: 22, tint: Theme.textMuted) {
+                    let t = dlna.duration > 0
+                        ? min(dlna.currentPosition + 30, dlna.duration)
+                        : dlna.currentPosition + 30
+                    print(">>> SKIP +30s → \(t)s")
+                    Task {
+                        do { try await dlna.seek(to: t) }
+                        catch { errorMessage = error.localizedDescription }
+                    }
+                }
+            }
+
+            // Stop — отдельная строка, меньше акцента
+            IconButton(name: "stop.fill", size: 16, tint: Theme.textMuted) {
                 Task {
                     do { try await dlna.stop() }
                     catch { errorMessage = error.localizedDescription }
                 }
             }
-
-            // Rewind 10 s
-            IconButton(name: "gobackward.10", size: 22, tint: Theme.textMuted) {
-                let target = max(0, dlna.currentPosition - 10)
-                print(">>> SEEK TAPPED to \(target)s (rewind) — currentVideoURL=\(dlna.currentVideoURL?.absoluteString ?? "nil")")
-                Task {
-                    do { try await dlna.seek(to: target) }
-                    catch { errorMessage = error.localizedDescription }
-                }
-            }
-
-            // Play / Pause (big circle button)
-            if isCasting {
-                ProgressView()
-                    .tint(Theme.accent)
-                    .frame(width: 48, height: 48)
-            } else {
-                Button {
-                    print(">>> TOGGLE TAPPED, isPaused=\(dlna.isPaused), transportState=\(dlna.transportState), isPlaying=\(isPlaying)")
-                    Task {
-                        do {
-                            if isPlaying {
-                                print(">>> PAUSE BUTTON TAPPED")
-                                try await dlna.pause()
-                            } else {
-                                print(">>> PLAY BUTTON TAPPED")
-                                try await dlna.play()
-                            }
-                        } catch {
-                            print(">>> PAUSE/PLAY ERROR: \(error)")
-                            errorMessage = error.localizedDescription
-                        }
-                    }
-                } label: {
-                    ZStack {
-                        Circle()
-                            .fill(Theme.accent)
-                            .frame(width: 48, height: 48)
-                        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 20))
-                            .foregroundStyle(.white)
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-
-            // Forward 30 s
-            IconButton(name: "goforward.30", size: 22, tint: Theme.textMuted) {
-                let target = dlna.duration > 0
-                    ? min(dlna.currentPosition + 30, dlna.duration)
-                    : dlna.currentPosition + 30
-                print(">>> SEEK TAPPED to \(target)s (forward) — currentVideoURL=\(dlna.currentVideoURL?.absoluteString ?? "nil")")
-                Task {
-                    do { try await dlna.seek(to: target) }
-                    catch { errorMessage = error.localizedDescription }
-                }
-            }
-
-            // Placeholder to balance layout
-            Color.clear.frame(width: 22, height: 22)
         }
     }
 
@@ -367,7 +378,18 @@ private struct IconButton: View {
             Image(systemName: name)
                 .font(.system(size: size))
                 .foregroundStyle(tint)
+                .frame(width: 44, height: 44)   // минимальная tap-зона по HIG
+                .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ScaleButtonStyle())
+    }
+}
+
+private struct ScaleButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.78 : 1.0)
+            .opacity(configuration.isPressed ? 0.55 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
