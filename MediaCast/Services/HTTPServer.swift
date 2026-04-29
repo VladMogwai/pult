@@ -32,6 +32,7 @@ final class HTTPServer: ObservableObject {
         try server.start(port, forceIPv4: false, priority: .default)
         isRunning = true
         UIApplication.shared.isIdleTimerDisabled = true
+        BackgroundKeepAlive.shared.start()
     }
 
     func stop() {
@@ -39,6 +40,7 @@ final class HTTPServer: ObservableObject {
         fileLock.withLock { servedFiles.removeAll() }
         isRunning = false
         UIApplication.shared.isIdleTimerDisabled = false
+        BackgroundKeepAlive.shared.stop()
     }
 
     // MARK: - File Registration

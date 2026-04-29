@@ -26,6 +26,12 @@
         <true/>
     </dict>
 
+    <!-- Keep the HTTP server alive when the phone is locked during casting. -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
+
     <!-- Standard iOS keys -->
     <key>UILaunchScreen</key>
     <dict/>

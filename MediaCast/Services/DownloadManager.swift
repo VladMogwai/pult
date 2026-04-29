@@ -221,7 +221,8 @@ final class DownloadManager: NSObject, ObservableObject {
             let safe = title
                 .components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|"))
                 .joined(separator: "_")
-            let filename = "\(abs(key.hashValue))_\(safe.prefix(30))_\(quality.quality).ts"
+            let dateFmt = DateFormatter(); dateFmt.dateFormat = "yyyy-MM-dd"
+            let filename = "\(safe)_\(dateFmt.string(from: Date())).ts"
             let dest = dir.appendingPathComponent(filename)
             if FileManager.default.fileExists(atPath: dest.path) {
                 try FileManager.default.removeItem(at: dest)
@@ -524,7 +525,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
         let safe = title
             .components(separatedBy: CharacterSet(charactersIn: "/\\:*?\"<>|"))
             .joined(separator: "_")
-        let filename = "\(abs(key.hashValue))_\(safe.prefix(30))_\(qualityLabel).mp4"
+        let dateFmt = DateFormatter(); dateFmt.dateFormat = "yyyy-MM-dd"
+        let filename = "\(safe)_\(dateFmt.string(from: Date())).mp4"
         let dest = dir.appendingPathComponent(filename)
 
         do {
